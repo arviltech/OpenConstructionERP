@@ -41,6 +41,10 @@ interface Measurement {
   /** Per-measurement stroke width override in CSS px (issue #312). Round-trips
    *  via metadata; falls back to the 2px hairline when unset. */
   strokeWidth?: number;
+  /** Per-measurement band width in real-world METRES. Round-trips
+   *  via metadata; when set the band renders at true scale via the page
+   *  calibration and overrides `strokeWidth`. Canonical-metric like #270. */
+  strokeWidthReal?: number;
   /** Per-measurement STROKE (line) opacity for linear types (issue #332).
    *  Round-trips via metadata; falls back to fully opaque when unset. */
   strokeAlpha?: number;
@@ -316,6 +320,7 @@ function toApiFormat(
       // so a re-styled measurement survives a server sync.
       fill_alpha: m.fillAlpha,
       stroke_width: m.strokeWidth,
+      stroke_width_real: m.strokeWidthReal,
       stroke_alpha: m.strokeAlpha,
       // Reported-quantity adjustments (issue #332 wave): slope / wastage /
       // typical-multiplier ride the metadata blob like the appearance overrides
@@ -370,6 +375,7 @@ function syncSignature(m: Measurement): string {
     // edit must re-sync so the server copy carries it.
     fa: m.fillAlpha ?? null,
     sw: m.strokeWidth ?? null,
+    swr: m.strokeWidthReal ?? null,
     sa: m.strokeAlpha ?? null,
     // Reported-quantity adjustments (issue #332 wave): a slope / wastage /
     // multiplier edit changes the reported quantity, so it must re-sync.
@@ -429,6 +435,7 @@ function toApiUpdate(
     // PATCH because the server replaces the metadata blob wholesale.
     fill_alpha: m.fillAlpha,
     stroke_width: m.strokeWidth,
+    stroke_width_real: m.strokeWidthReal,
     stroke_alpha: m.strokeAlpha,
     // Reported-quantity adjustments (issue #332 wave); re-sent on PATCH for
     // the same reason (the server replaces the metadata blob wholesale).
@@ -503,6 +510,7 @@ function fromApiFormat(r: MeasurementResponse): Measurement {
     height: (meta.height as number) ?? undefined,
     fillAlpha: (meta.fill_alpha as number) ?? undefined,
     strokeWidth: (meta.stroke_width as number) ?? undefined,
+    strokeWidthReal: (meta.stroke_width_real as number) ?? undefined,
     strokeAlpha: (meta.stroke_alpha as number) ?? undefined,
     slopeFactor: (meta.slope_factor as number) ?? undefined,
     wastagePct: (meta.wastage_pct as number) ?? undefined,

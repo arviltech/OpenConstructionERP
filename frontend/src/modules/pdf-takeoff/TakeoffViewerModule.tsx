@@ -91,6 +91,7 @@ import {
   presetScale,
   formatScaleRatio,
   toMeters,
+  fromMeters,
 } from './data/scale-helpers';
 import {
   type PageScales,
@@ -266,6 +267,11 @@ interface Measurement {
   height?: number; // Height for rectangle/highlight
   fillAlpha?: number; // Per-measurement fill opacity 0..1 (issue #311)
   strokeWidth?: number; // Per-measurement stroke width in CSS px (issue #312)
+  /** Per-measurement band width in real-world METRES. When set,
+   *  the linear band renders at true scale via the page calibration (footing at
+   *  its actual 18" width) and re-scales with zoom, overriding the px strokeWidth.
+   *  Canonical-metric like every other stored quantity (#270). */
+  strokeWidthReal?: number;
   strokeAlpha?: number; // Per-measurement LINE opacity 0..1 for linear types (issue #332)
   /** True-surface slope / pitch factor for an AREA measurement (roofs, ramps):
    *  true surface qty = plan area x slopeFactor (>= 1). Undefined = 1 (flat). */
@@ -723,6 +729,16 @@ export default function TakeoffViewerModule({
   // (D-TKC-016); this drives display + export conversion (m -> ft, etc.).
   // Read with a selector so unrelated preference changes don't re-render.
   const measurementSystem = usePreferencesStore((s) => s.measurementSystem);
+  /** Line-width control unit mode: 'px' = on-screen pixels
+   *  (cosmetic — the #312/#338 control); 'real' = a real-world band width that
+   *  renders at true scale via the page calibration. The real unit follows the
+   *  measurement system (metres, or feet+inches). `widthDraft` holds the in-progress
+   *  entry so typing is not renormalised mid-edit; the canonical value is always
+   *  `strokeWidthReal` in metres. Seeded from the selected measurement below. */
+  const [widthMode, setWidthMode] = useState<'px' | 'real'>('px');
+  const [widthDraft, setWidthDraft] = useState<{ m: string; ft: string; in: string }>({
+    m: '', ft: '', in: '',
+  });
 
   // Selected measurement (drives the right-side Properties panel).
   const [selectedMeasurementId, setSelectedMeasurementId] = useState<string | null>(null);
@@ -1387,7 +1403,15 @@ export default function TakeoffViewerModule({
       // to the 2px hairline so unset measurements render exactly as before.
       // The width scales with zoom (issue #321) so the outline stays fixed
       // relative to the geometry as the user zooms, matching document space.
-      ctx.lineWidth = (m.strokeWidth ?? 2) * dpr * zoom;
+      // A real-world band width (strokeWidthReal, in metres)
+      // renders at TRUE scale via the page calibration, so an 18" footing draws
+      // 18" wide on the sheet and re-scales with zoom. It falls back to the px
+      // strokeWidth (then the 2px hairline) when unset or the page is uncalibrated.
+      const effStrokePx =
+        m.strokeWidthReal != null && scale.pixelsPerUnit > 0
+          ? m.strokeWidthReal * scale.pixelsPerUnit
+          : (m.strokeWidth ?? 2);
+      ctx.lineWidth = effStrokePx * dpr * zoom;
       // AI suggestions (#194) render translucent + dashed until the user
       // confirms them, so they read as proposals rather than committed work.
       ctx.globalAlpha = m.suggested ? 0.5 : 1.0;
@@ -3460,6 +3484,29 @@ export default function TakeoffViewerModule({
     if (!selectedMeasurementId) return null;
     return measurements.find((m) => m.id === selectedMeasurementId) ?? null;
   }, [selectedMeasurementId, measurements]);
+
+  /** Seed the line-width control whenever the selection changes:
+   *  pick px vs real mode from whether a real band width is stored, and fill the
+   *  draft inputs so a reopen shows the current value. Keyed on the id only, so
+   *  editing the width does not renormalise the fields while the user is typing. */
+  useEffect(() => {
+    const m = selectedMeasurement;
+    if (!m) return;
+    if (m.strokeWidthReal != null) {
+      const totalIn = fromMeters(m.strokeWidthReal, 'in');
+      const ft = Math.floor(totalIn / 12);
+      setWidthMode('real');
+      setWidthDraft({
+        m: String(Number(fromMeters(m.strokeWidthReal, 'm').toFixed(4))),
+        ft: ft ? String(ft) : '',
+        in: String(Number((totalIn - ft * 12).toFixed(2))),
+      });
+    } else {
+      setWidthMode('px');
+      setWidthDraft({ m: '', ft: '', in: '' });
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [selectedMeasurementId]);
 
   /** All unique group names across all measurements — for the properties-panel
    *  Group dropdown so users can move items into existing groups. */
@@ -7084,58 +7131,210 @@ export default function TakeoffViewerModule({
                   </div>
                 )}
 
-                {/* Line width (issue #312): distance and polyline runs render at a
-                    2px hairline; raise it so two near-identical lines (a footing
-                    and the stem wall above it) can be told apart. Unset = 2px. */}
+                {/* Line width (issue #312/#338): distance + polyline
+                    runs render at a 2px hairline by default. The unit selector on the
+                    right switches between on-screen PIXELS (cosmetic, so two near-
+                    identical lines — a footing and the stem wall above it — can be told
+                    apart) and a REAL-WORLD width that renders at true scale via the page
+                    calibration (type a footing's actual 18" and the band draws 18" wide,
+                    re-scaling with zoom). Real width is stored canonical-metric; the unit
+                    follows the measurement system (metres, or feet+inches). The two modes
+                    are mutually exclusive — picking one clears the other. */}
                 {(selectedMeasurement.type === 'distance' ||
                   selectedMeasurement.type === 'polyline') && (
                   <div>
-                    <label className="text-[10px] font-semibold text-content-tertiary flex items-center justify-between mb-0.5">
+                    <div className="text-[10px] font-semibold text-content-tertiary flex items-center justify-between mb-0.5">
                       <span>{t('takeoff_viewer.prop_stroke_width', { defaultValue: 'Line width' })}</span>
-                      <span className="tabular-nums">{selectedMeasurement.strokeWidth ?? 2}px</span>
-                    </label>
-                    <div className="flex items-center gap-2">
-                      <input
-                        type="range"
-                        min={1}
-                        max={50}
-                        step={1}
-                        value={Math.min(selectedMeasurement.strokeWidth ?? 2, 50)}
-                        onChange={(e) =>
-                          updateSelectedMeasurement({ strokeWidth: Number(e.target.value) })
-                        }
-                        className="flex-1"
-                        data-testid="prop-stroke-width"
-                      />
-                      {/* Numeric field so a width beyond the 50px slider can be typed
-                          for very wide elements like a continuous footing (issue #338);
-                          clamped to 1-100px. The slider value above is capped at its own
-                          max so the thumb stays valid when a larger width is typed here. */}
-                      <input
-                        type="number"
-                        min={1}
-                        max={100}
-                        step={1}
-                        value={selectedMeasurement.strokeWidth ?? 2}
-                        onChange={(e) => {
-                          const v = Number(e.target.value);
-                          if (!Number.isFinite(v) || v < 1) return;
-                          updateSelectedMeasurement({ strokeWidth: Math.min(100, Math.round(v)) });
-                        }}
-                        className="w-16 rounded border border-border bg-surface-primary px-1.5 py-1 text-xs text-content-primary tabular-nums"
-                        data-testid="prop-stroke-width-num"
-                      />
-                      {selectedMeasurement.strokeWidth != null && (
-                        <button
-                          type="button"
-                          onClick={() => updateSelectedMeasurement({ strokeWidth: undefined })}
-                          className="text-[10px] text-content-tertiary hover:text-content-primary underline"
-                          data-testid="prop-stroke-width-reset"
+                      <div className="flex items-center gap-1">
+                        {widthMode === 'real' && selectedMeasurement.strokeWidthReal != null && !isCalibrated && (
+                          <span
+                            className="text-amber-500"
+                            title={t('takeoff_viewer.prop_stroke_width_real_uncal', { defaultValue: 'Calibrate this page for the real width to render at true scale' })}
+                          >
+                            {t('takeoff_viewer.not_calibrated_short', { defaultValue: 'not calibrated' })}
+                          </span>
+                        )}
+                        <select
+                          value={widthMode}
+                          onChange={(e) => {
+                            const next = e.target.value as 'px' | 'real';
+                            // Carry the current value across units so it is shared
+                            // between px and real: px<->metres uses this page's scale
+                            // (px / ppu = metres). Uses the SELECTED measurement's page
+                            // scale, which may differ from the page in view.
+                            const ppu = scaleForPage(pageScales, selectedMeasurement.page).pixelsPerUnit;
+                            setWidthMode(next);
+                            if (next === 'real') {
+                              // px -> real: convert the current px width (default 2) to its
+                              // real-world equivalent and commit it, so switching units keeps
+                              // the same rendered width. Empty if the page has no scale.
+                              const px = selectedMeasurement.strokeWidth ?? 2;
+                              const metres = ppu > 0 ? px / ppu : null;
+                              if (metres != null && metres > 0) {
+                                const totalIn = fromMeters(metres, 'in');
+                                const ft = Math.floor(totalIn / 12);
+                                setWidthDraft({
+                                  m: String(Number(fromMeters(metres, 'm').toFixed(4))),
+                                  ft: ft ? String(ft) : '',
+                                  in: String(Number((totalIn - ft * 12).toFixed(2))),
+                                });
+                                updateSelectedMeasurement({ strokeWidthReal: metres, strokeWidth: undefined });
+                              } else {
+                                setWidthDraft({ m: '', ft: '', in: '' });
+                              }
+                            } else {
+                              // real -> px: convert the stored real width back to pixels
+                              // (metres * ppu), clamped to the 1-100px control range.
+                              const r = selectedMeasurement.strokeWidthReal;
+                              if (r != null && ppu > 0) {
+                                const px = Math.min(100, Math.max(1, Math.round(r * ppu)));
+                                updateSelectedMeasurement({ strokeWidth: px, strokeWidthReal: undefined });
+                              } else {
+                                updateSelectedMeasurement({ strokeWidthReal: undefined });
+                              }
+                              setWidthDraft({ m: '', ft: '', in: '' });
+                            }
+                          }}
+                          className="rounded border border-border bg-surface-primary px-1 py-0.5 text-[10px] text-content-primary"
+                          data-testid="prop-width-unit"
+                          aria-label={t('takeoff_viewer.prop_width_unit', { defaultValue: 'Line width unit' })}
                         >
-                          {t('takeoff_viewer.reset', { defaultValue: 'Reset' })}
-                        </button>
-                      )}
+                          <option value="px">px</option>
+                          <option value="real">{measurementSystem === 'imperial' ? 'ft-in' : 'm'}</option>
+                        </select>
+                      </div>
                     </div>
+
+                    {widthMode === 'px' ? (
+                      <div className="flex items-center gap-2">
+                        <input
+                          type="range"
+                          min={1}
+                          max={50}
+                          step={1}
+                          value={Math.min(selectedMeasurement.strokeWidth ?? 2, 50)}
+                          onChange={(e) =>
+                            updateSelectedMeasurement({ strokeWidth: Number(e.target.value), strokeWidthReal: undefined })
+                          }
+                          className="flex-1"
+                          data-testid="prop-stroke-width"
+                        />
+                        {/* Numeric field so a width beyond the 50px slider can be typed
+                            for very wide elements like a continuous footing (issue #338);
+                            clamped to 1-100px. */}
+                        <input
+                          type="number"
+                          min={1}
+                          max={100}
+                          step={1}
+                          value={selectedMeasurement.strokeWidth ?? 2}
+                          onChange={(e) => {
+                            const v = Number(e.target.value);
+                            if (!Number.isFinite(v) || v < 1) return;
+                            updateSelectedMeasurement({ strokeWidth: Math.min(100, Math.round(v)), strokeWidthReal: undefined });
+                          }}
+                          className="w-16 rounded border border-border bg-surface-primary px-1.5 py-1 text-xs text-content-primary tabular-nums"
+                          data-testid="prop-stroke-width-num"
+                        />
+                        <span className="text-[10px] text-content-tertiary">px</span>
+                        {selectedMeasurement.strokeWidth != null && (
+                          <button
+                            type="button"
+                            onClick={() => updateSelectedMeasurement({ strokeWidth: undefined, strokeWidthReal: undefined })}
+                            className="text-[10px] text-content-tertiary hover:text-content-primary underline"
+                            data-testid="prop-stroke-width-reset"
+                          >
+                            {t('takeoff_viewer.reset', { defaultValue: 'Reset' })}
+                          </button>
+                        )}
+                      </div>
+                    ) : measurementSystem === 'imperial' ? (
+                      <div className="flex items-center gap-1">
+                        <input
+                          type="number"
+                          min={0}
+                          step={1}
+                          placeholder="0"
+                          value={widthDraft.ft}
+                          onChange={(e) => {
+                            const nextDraft = { ...widthDraft, ft: e.target.value };
+                            setWidthDraft(nextDraft);
+                            const total = toMeters(parseFloat(nextDraft.ft) || 0, 'ft') + toMeters(parseFloat(nextDraft.in) || 0, 'in');
+                            updateSelectedMeasurement({
+                              strokeWidthReal: nextDraft.ft === '' && nextDraft.in === '' ? undefined : (total > 0 ? total : undefined),
+                              strokeWidth: undefined,
+                            });
+                          }}
+                          className="w-12 rounded border border-border bg-surface-primary px-1.5 py-1 text-xs text-content-primary tabular-nums"
+                          data-testid="prop-stroke-width-ft"
+                          aria-label={t('takeoff_viewer.feet', { defaultValue: 'feet' })}
+                        />
+                        <span className="text-[10px] text-content-tertiary">ft</span>
+                        <input
+                          type="number"
+                          min={0}
+                          step="any"
+                          placeholder="0"
+                          value={widthDraft.in}
+                          onChange={(e) => {
+                            const nextDraft = { ...widthDraft, in: e.target.value };
+                            setWidthDraft(nextDraft);
+                            const total = toMeters(parseFloat(nextDraft.ft) || 0, 'ft') + toMeters(parseFloat(nextDraft.in) || 0, 'in');
+                            updateSelectedMeasurement({
+                              strokeWidthReal: nextDraft.ft === '' && nextDraft.in === '' ? undefined : (total > 0 ? total : undefined),
+                              strokeWidth: undefined,
+                            });
+                          }}
+                          className="w-14 rounded border border-border bg-surface-primary px-1.5 py-1 text-xs text-content-primary tabular-nums"
+                          data-testid="prop-stroke-width-in"
+                          aria-label={t('takeoff_viewer.inches', { defaultValue: 'inches' })}
+                        />
+                        <span className="text-[10px] text-content-tertiary">in</span>
+                        {selectedMeasurement.strokeWidthReal != null && (
+                          <button
+                            type="button"
+                            onClick={() => { updateSelectedMeasurement({ strokeWidthReal: undefined }); setWidthDraft({ m: '', ft: '', in: '' }); }}
+                            className="ml-1 text-[10px] text-content-tertiary hover:text-content-primary underline"
+                            data-testid="prop-stroke-width-real-reset"
+                          >
+                            {t('takeoff_viewer.reset', { defaultValue: 'Reset' })}
+                          </button>
+                        )}
+                      </div>
+                    ) : (
+                      <div className="flex items-center gap-1">
+                        <input
+                          type="number"
+                          min={0}
+                          step="any"
+                          placeholder="e.g. 0.15"
+                          value={widthDraft.m}
+                          onChange={(e) => {
+                            const raw = e.target.value;
+                            setWidthDraft({ ...widthDraft, m: raw });
+                            const v = parseFloat(raw);
+                            updateSelectedMeasurement({
+                              strokeWidthReal: raw === '' ? undefined : (Number.isFinite(v) && v > 0 ? v : undefined),
+                              strokeWidth: undefined,
+                            });
+                          }}
+                          className="w-20 rounded border border-border bg-surface-primary px-1.5 py-1 text-xs text-content-primary tabular-nums"
+                          data-testid="prop-stroke-width-m"
+                          aria-label={t('takeoff_viewer.meters', { defaultValue: 'metres' })}
+                        />
+                        <span className="text-[10px] text-content-tertiary">m</span>
+                        {selectedMeasurement.strokeWidthReal != null && (
+                          <button
+                            type="button"
+                            onClick={() => { updateSelectedMeasurement({ strokeWidthReal: undefined }); setWidthDraft({ m: '', ft: '', in: '' }); }}
+                            className="ml-1 text-[10px] text-content-tertiary hover:text-content-primary underline"
+                            data-testid="prop-stroke-width-real-reset"
+                          >
+                            {t('takeoff_viewer.reset', { defaultValue: 'Reset' })}
+                          </button>
+                        )}
+                      </div>
+                    )}
                   </div>
                 )}
 

@@ -40,6 +40,7 @@ type TestMeasurement = {
   serverId?: string;
   color?: string;
   text?: string;
+  strokeWidthReal?: number;
 };
 const makeMeasurement = (id: string, page = 1): TestMeasurement => ({
   id,
@@ -140,6 +141,32 @@ describe('useMeasurementPersistence', () => {
     expect(parsed.scale.pixelsPerUnit).toBe(100);
     expect(parsed.savedAt).toBeGreaterThan(0);
     expect(getDocumentIndex()).toContain(compositeKey);
+  });
+
+  it('round-trips strokeWidthReal (real-world band width) through localStorage', () => {
+    // 18" footing width, stored canonical-metric in metres.
+    const m1: TestMeasurement = { ...makeMeasurement('m1'), strokeWidthReal: 0.4572 };
+    const setM = vi.fn();
+    const setPS = vi.fn();
+    const { result } = renderHook(() =>
+      useMeasurementPersistence({
+        fileName: 'bands.pdf',
+        documentId: DOC,
+        measurements: [m1],
+        setMeasurements: setM,
+        pageScales: basePageScales,
+        setPageScales: setPS,
+        scale: defaultScale,
+        projectId: PROJECT,
+      }),
+    );
+
+    act(() => {
+      result.current.saveNow();
+    });
+
+    const parsed = JSON.parse(localStorage.getItem(compositeKey)!);
+    expect(parsed.measurements[0].strokeWidthReal).toBeCloseTo(0.4572, 6);
   });
 
   it('persists locally (not under a composite key) when there is no document UUID', () => {
@@ -568,6 +595,26 @@ describe('useMeasurementPersistence', () => {
     // ...but the page-scale model is NOT replaced with a phantom calibration:
     // an explicit ``scale_calibrated:false`` page stays on the default.
     expect(setPS).not.toHaveBeenCalled();
+  });
+
+  it('hydrates strokeWidthReal from the server metadata blob', async () => {
+    const { takeoffApi } = await import('@/features/takeoff/api');
+    (takeoffApi.list as unknown as ReturnType<typeof vi.fn>).mockResolvedValueOnce([
+      serverRow({ metadata: { frontend_id: 'm1', stroke_width_real: 0.4572 } }),
+    ]);
+    const setM = vi.fn();
+    const setPS = vi.fn();
+    renderHook(() =>
+      useMeasurementPersistence({
+        fileName: 'bands.pdf', documentId: DOC, measurements: [],
+        setMeasurements: setM, pageScales: basePageScales, setPageScales: setPS,
+        scale: defaultScale, projectId: PROJECT,
+      }),
+    );
+
+    await waitFor(() => expect(setM).toHaveBeenCalled());
+    const hydrated = setM.mock.calls[setM.mock.calls.length - 1]![0] as Array<{ strokeWidthReal?: number }>;
+    expect(hydrated[0]!.strokeWidthReal).toBeCloseTo(0.4572, 6);
   });
 
   it('restores an explicitly calibrated page from the server (issue #277)', async () => {

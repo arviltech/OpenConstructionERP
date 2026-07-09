@@ -5417,7 +5417,7 @@ export default function TakeoffViewerModule({
   ];
 
   return (
-    <div className="relative space-y-4">
+    <div className="relative flex min-h-0 flex-1 flex-col space-y-4">
       {/* Decorative field-surveyor geometry — rectangles and polylines
           like what an estimator drags across a drawing to measure
           area or perimeter.  Very low opacity, behind everything,
@@ -5707,14 +5707,13 @@ export default function TakeoffViewerModule({
 
       {/* Viewer + Sidebar (PDF on the left, Measurements panel on the right) */}
       {pdfDoc && (
-        <div className="flex gap-4 min-w-0">
+        <div className="flex flex-1 min-h-0 gap-4 min-w-0">
           {/* Page thumbnails strip - only for multi-page sets and when toggled
               on. Click a thumbnail to jump; the current page is ringed; a badge
               shows that page's measurement count. */}
           {totalPages > 1 && showThumbnails && (
             <div
-              className="w-32 shrink-0 overflow-y-auto rounded-lg border border-border bg-surface-primary p-2 space-y-2"
-              style={{ maxHeight: 'calc(100vh - 396px)' }}
+              className="w-32 shrink-0 min-h-0 overflow-y-auto rounded-lg border border-border bg-surface-primary p-2 space-y-2"
               data-testid="thumbnail-strip"
             >
               {Array.from({ length: totalPages }, (_, i) => i + 1).map((n) => (
@@ -5754,13 +5753,13 @@ export default function TakeoffViewerModule({
             </div>
           )}
           {/* Left: PDF + Toolbar */}
-          <div className="flex-1 min-w-0 space-y-2">
+          <div className="flex flex-1 min-h-0 min-w-0 flex-col space-y-2">
             {/* Toolbar - two grouped rows so every control stays visible
                 without a horizontal scrollbar. Row 1 = navigate + view +
                 document actions; row 2 = scale + drawing tools. Related
                 controls sit in soft "segmented" tracks instead of being
                 separated by hairline dividers. */}
-            <div className="flex flex-col gap-1.5 rounded-lg border border-border bg-surface-primary p-1.5 shadow-xs">
+            <div className="sticky top-0 z-20 flex flex-col gap-1.5 rounded-lg border border-border bg-surface-primary p-1.5 shadow-xs">
               <div className="flex items-center gap-1 flex-wrap">
               {/* Page nav - prev / jump / next in one segmented track. */}
               <div className={TB_GROUP}>
@@ -6347,22 +6346,16 @@ export default function TakeoffViewerModule({
 
             {/* Canvas — the PDF render surface is a genuinely-needed internal
                 scroll region (drawings are far larger than any viewport).
-                The cap must match the height actually left over after the
-                page chrome the parent column does NOT subtract: header (52)
-                + main pt-6/pb-4 (40) + takeoff tabs bar (~56) + module
-                spacing + toolbar (~80, two rows) + bottom Documents
-                filmstrip (~175). The old `100vh - 280px` under-reserved by
-                ~80px, so the canvas + right sidebar pushed the workspace past
-                the fixed-height column and forced a second scrollbar. This is a
-                definite height, not a max-height: fit-to-page reads the
-                container clientHeight, so a content-sized box let every fit
-                measure the height the previous fit had just produced and zoom
-                out again on each click (#306). A minHeight keeps it usable on
+                Keep its height definite by inheriting the page's fixed-height
+                flex column through the module, viewer row and canvas column.
+                Fit-to-page reads container clientHeight, so it must not be a
+                content-sized box that feeds the previous zoom back into the
+                next fit calculation (#306). A minHeight keeps it usable on
                 very short viewports. */}
             <div
               ref={containerRef}
-              className="relative rounded-lg border border-border overflow-auto bg-gray-100 dark:bg-gray-900"
-              style={{ height: 'calc(100vh - 396px)', minHeight: '320px', maxWidth: '100%' }}
+              className="relative flex-1 min-h-0 rounded-lg border border-border overflow-auto bg-gray-100 dark:bg-gray-900"
+              style={{ minHeight: '320px', maxWidth: '100%' }}
             >
               <canvas ref={canvasRef} className="block" />
               <canvas

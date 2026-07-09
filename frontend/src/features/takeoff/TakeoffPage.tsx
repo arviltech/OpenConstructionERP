@@ -1926,7 +1926,7 @@ export function TakeoffPage() {
   /* ── Render ─────────────────────────────────────────────────────────── */
 
   return (
-    <div className="relative w-full overflow-x-hidden animate-fade-in">
+    <div className="relative flex h-[calc(100vh-var(--oe-header-height,52px)-2.5rem)] min-h-0 w-full flex-col overflow-x-hidden overflow-y-auto animate-fade-in">
       {/* Barely-visible field-surveyor geometry — rectangles, irregular
           polygons, distance dimension lines, vertex pins — the kind of
           marks an estimator drags across a drawing to measure area or
@@ -1998,7 +1998,7 @@ export function TakeoffPage() {
       {/* Header zone — full-bleed viewer keeps its own SVG chrome on the root,
           so the canonical breadcrumb > header > info > tabs block carries its
           own space-y-5 rhythm here (style guide §1 viewer exception). */}
-      <div className="space-y-5">
+      <div className="shrink-0 space-y-5">
       {/* Breadcrumb and the "How it works" guide button share one row so the
           guide action sits level with the project / page trail and the blocks
           below move up (founder layout request). The module name + icon still
@@ -2136,7 +2136,7 @@ export function TakeoffPage() {
           role="tabpanel"
           id="takeoff-tabpanel-documents"
           aria-labelledby="takeoff-tab-documents"
-          className="mt-5"
+          className="mt-5 flex-1 min-h-0 overflow-y-auto"
         >
           {/* AI provider setup notice — explains that AI takeoff needs a
               provider connected and links to AI settings. Hidden while the
@@ -2309,26 +2309,17 @@ export function TakeoffPage() {
 
         </div>
       ) : (
-        // Viewport-bounded column so the bottom file panel is always
-        // visible without scrolling the page: the viewer takes the
-        // remaining height and scrolls internally; the filmstrip is a
-        // shrink-0 footer pinned in view.
-        //
-        // Height budget: the column already sits below the sticky header
-        // (--oe-header-height, 52px), the <main> pt-6 (1.5rem) and the
-        // takeoff tabs bar (~3.25rem incl. its mb-3) — all of which the
-        // 100vh calc must NOT count again. Empirically, 7rem total is the
-        // smallest reservation that keeps the column fully inside the
-        // viewport (no page-level scrollbar) while giving the viewer the
-        // most internal height — 8rem wasted ~1rem that was shrinking the
-        // viewer enough to force an internal scrollbar on laptop screens.
+        // The root has a viewport-derived height, so this panel takes the
+        // remaining flex space below the header chrome. That keeps the viewer
+        // self-adjusting across info-card collapsed/expanded states without a
+        // hand-tuned height reservation.
         <div
-          className="mt-5 flex flex-col h-[calc(100vh-var(--oe-header-height,52px)-7rem)] min-h-0 overflow-x-hidden"
+          className="mt-5 flex flex-col flex-1 min-h-0 overflow-x-hidden"
           role="tabpanel"
           id="takeoff-tabpanel-measurements"
           aria-labelledby="takeoff-tab-measurements"
         >
-          <div className="flex-1 min-h-0 overflow-y-auto overflow-x-hidden">
+          <div className="flex flex-1 min-h-0 flex-col overflow-y-auto overflow-x-hidden">
             {deepLinkNotFound && !viewerDoc ? (
               <div
                 className="mx-auto my-8 max-w-md rounded-xl border border-amber-200 dark:border-amber-800/40 bg-amber-50 dark:bg-amber-900/20 px-6 py-8 text-center"

@@ -1805,8 +1805,10 @@ export default function TakeoffViewerModule({
       ctx.restore();
     }
 
-    // In-progress rectangle/highlight drag preview
-    if (rectStartPoint && isDraggingRect && activePoints.length === 1) {
+    // In-progress rectangle/highlight drag preview (suppressed during a
+    // calibration pick, like the rubber-band, so the frozen in-progress
+    // shape doesn't linger under the calibration line).
+    if (rectStartPoint && isDraggingRect && activePoints.length === 1 && !settingScale) {
       const p0 = rectStartPoint;
       const p1 = activePoints[0]!;
       const rx = Math.min(p0.x, p1.x) * dpr * zoom;
@@ -2247,6 +2249,11 @@ export default function TakeoffViewerModule({
           const np1 = newPoints[1]!;
           const dist = pixelDistance(np0.x, np0.y, np1.x, np1.y);
           setSettingScale(false);
+          // The pick is done: clear the calibration-tracked cursor so the
+          // drawing rubber-band doesn't reappear at the stale snapped point
+          // behind the dialog before the next mouse move.
+          setLiveCursor(null);
+          setSnapPoint(null);
           if (calibrationMode) {
             // Route to the new multi-unit calibration dialog.
             setCalibrationPixels(dist);
@@ -3109,6 +3116,10 @@ export default function TakeoffViewerModule({
     setCalibrationMode(true);
     setSettingScale(true);
     setScalePoints([]);
+    // Drop drawing-path overlay state so a mid-draw cursor/snap indicator
+    // doesn't stay frozen on screen while the pick is in progress.
+    setLiveCursor(null);
+    setSnapPoint(null);
   }, []);
 
   /** User confirmed the calibration dialog — persist the new scale.
@@ -3438,12 +3449,13 @@ export default function TakeoffViewerModule({
   const drawReadout: DrawReadout | null = useMemo(() => {
     if (
       !liveCursor ||
+      settingScale ||
       !(activeTool === 'distance' || activeTool === 'polyline' || activeTool === 'area' || activeTool === 'volume')
     ) {
       return null;
     }
     return computeDrawReadout(activePoints, liveCursor, scale);
-  }, [liveCursor, activeTool, activePoints, scale]);
+  }, [liveCursor, settingScale, activeTool, activePoints, scale]);
 
   /** The measurement currently hovered in select mode (for the tooltip). */
   const hoverMeasurement = useMemo(
@@ -5394,10 +5406,14 @@ export default function TakeoffViewerModule({
           return;
         }
         if (calibrationMode || settingScale) {
-          // Bail out of two-click pick mode cleanly.
+          // Bail out of two-click pick mode cleanly (including the
+          // calibration-tracked cursor, so the drawing rubber-band doesn't
+          // reappear at a stale point before the next mouse move).
           setCalibrationMode(false);
           setSettingScale(false);
           setScalePoints([]);
+          setLiveCursor(null);
+          setSnapPoint(null);
           return;
         }
         // Leave sticky pan mode (#316), mirroring a second click on the toggle.

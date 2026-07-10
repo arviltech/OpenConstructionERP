@@ -284,6 +284,43 @@ export function orthoSnap(anchor: Point, cursor: Point): Point {
   };
 }
 
+/**
+ * Ortho-snap a dragged vertex against its adjacent vertices, choosing the
+ * candidate closest to the raw cursor. Closed shapes include the wraparound
+ * neighbours of the first and last vertices.
+ */
+export function orthoSnapVertexDrag(
+  points: Point[],
+  vertexIndex: number,
+  cursor: Point,
+  closed: boolean,
+): Point {
+  if (vertexIndex < 0 || vertexIndex >= points.length || points.length < 2) return cursor;
+
+  const neighbourIndexes: number[] = [];
+  if (closed) {
+    neighbourIndexes.push(
+      (vertexIndex - 1 + points.length) % points.length,
+      (vertexIndex + 1) % points.length,
+    );
+  } else {
+    if (vertexIndex > 0) neighbourIndexes.push(vertexIndex - 1);
+    if (vertexIndex < points.length - 1) neighbourIndexes.push(vertexIndex + 1);
+  }
+
+  let closest = cursor;
+  let closestDistance = Number.POSITIVE_INFINITY;
+  for (const neighbourIndex of neighbourIndexes) {
+    const snapped = orthoSnap(points[neighbourIndex]!, cursor);
+    const distance = Math.hypot(snapped.x - cursor.x, snapped.y - cursor.y);
+    if (distance < closestDistance) {
+      closest = snapped;
+      closestDistance = distance;
+    }
+  }
+  return closest;
+}
+
 /* ── Duplicate trailing vertex (double-click finish) ─────────────────────
  * A double-click that closes a shape fires two `click` events before the
  * `dblclick`, so the last placed vertex is a near-duplicate of the one before

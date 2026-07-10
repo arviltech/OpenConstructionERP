@@ -124,6 +124,7 @@ import {
   zoomAtCursorScroll,
   wheelZoomStep,
   orthoSnap,
+  orthoSnapVertexDrag,
   dropTrailingDuplicateVertex,
   snapToVertex,
   VERTEX_SNAP_SCREEN_PX,
@@ -649,8 +650,8 @@ export default function TakeoffViewerModule({
     panLockRef.current = panLock;
   }, [panLock]);
 
-  /** Live pointer position in PDF units while a measure tool is active,
-   *  drives the running-length HUD. Null when the pointer is off-canvas. */
+  /** Live pointer position in PDF units while a measure tool or calibration
+   *  pick is active. Drives the running-length HUD / preview line. */
   const [liveCursor, setLiveCursor] = useState<Point | null>(null);
 
   /** Hover tooltip for an existing measurement in select mode: the measured
@@ -948,6 +949,7 @@ export default function TakeoffViewerModule({
     dragRef.current = null;
     activeVertexRef.current = null;
     setDragPreview(null);
+    setSnapPoint(null);
   }, [currentPage]);
 
   /* Deselect a measurement that lives on a different page than the one
@@ -1774,6 +1776,7 @@ export default function TakeoffViewerModule({
     if (
       liveCursor &&
       !panning &&
+      !settingScale &&
       activePoints.length > 0 &&
       (activeTool === 'distance' ||
         activeTool === 'polyline' ||
@@ -1832,12 +1835,12 @@ export default function TakeoffViewerModule({
         ctx.arc(p.x * dpr * zoom, p.y * dpr * zoom, 5 * dpr, 0, Math.PI * 2);
         ctx.fill();
       }
-      if (scalePoints.length === 2) {
+      const scalePreviewPoint = scalePoints.length === 2 ? scalePoints[1] : liveCursor;
+      if (scalePreviewPoint) {
         const sp0 = scalePoints[0]!;
-        const sp1 = scalePoints[1]!;
         ctx.beginPath();
         ctx.moveTo(sp0.x * dpr * zoom, sp0.y * dpr * zoom);
-        ctx.lineTo(sp1.x * dpr * zoom, sp1.y * dpr * zoom);
+        ctx.lineTo(scalePreviewPoint.x * dpr * zoom, scalePreviewPoint.y * dpr * zoom);
         ctx.stroke();
       }
     }
@@ -2181,10 +2184,11 @@ export default function TakeoffViewerModule({
       // constrains the new segment to 0 / 45 / 90 degrees from the previous
       // placed point. Rectangles are inherently axis-aligned so neither applies.
       const canVertexSnap =
-        activeTool === 'distance' ||
-        activeTool === 'polyline' ||
-        activeTool === 'area' ||
-        activeTool === 'volume';
+        !settingScale &&
+        (activeTool === 'distance' ||
+          activeTool === 'polyline' ||
+          activeTool === 'area' ||
+          activeTool === 'volume');
       // While drawing, the shape's own placed vertices (all but the immediately
       // preceding one, which the ortho lock already anchors) join the committed
       // snap pool, so a run can connect back to its own corners, above all its
@@ -2215,6 +2219,7 @@ export default function TakeoffViewerModule({
           return;
         }
       } else if (
+        !settingScale &&
         (orthoLock || shiftHeldRef.current) &&
         activePoints.length > 0 &&
         (activeTool === 'distance' ||
@@ -2229,6 +2234,12 @@ export default function TakeoffViewerModule({
 
       // Setting scale mode (legacy meters-only dialog OR new calibration).
       if (settingScale) {
+        if (
+          scalePoints.length === 1 &&
+          (orthoLock || shiftHeldRef.current)
+        ) {
+          point = orthoSnap(scalePoints[0]!, point);
+        }
         const newPoints = [...scalePoints, point];
         setScalePoints(newPoints);
         if (newPoints.length === 2) {
@@ -2714,6 +2725,7 @@ export default function TakeoffViewerModule({
       const drag = dragRef.current;
       dragRef.current = null;
       setDragPreview(null);
+      setSnapPoint(null);
       if (!drag) return;
       const live = measurementsRef.current.find((m) => m.id === drag.measurementId);
       if (!live) return;
@@ -2848,9 +2860,44 @@ export default function TakeoffViewerModule({
       if (!cur) return;
       let next: Point[];
       if (drag.mode === 'vertex') {
-        next = drag.origPoints.map((p, i) => (i === drag.vertexIndex ? cur : p));
+        const canSnapVertex =
+          drag.original.type === 'distance' ||
+          drag.original.type === 'polyline' ||
+          drag.original.type === 'area' ||
+          drag.original.type === 'volume';
+        const draggedPoint = drag.origPoints[drag.vertexIndex];
+        const snapPool = draggedPoint
+          ? snapVerticesRef.current.filter((point) => point !== draggedPoint)
+          : snapVerticesRef.current;
+        const vsnap = vertexSnapRef.current && canSnapVertex
+          ? snapToVertex(cur, snapPool, zoomRef.current || 1, VERTEX_SNAP_SCREEN_PX)
+          : null;
+        // Snap precedence (issue #303, then ortho): a nearby vertex is a
+        // stronger intent than the angle constraint. Otherwise the ortho lock
+        // uses the dragged vertex's adjacent segment anchors. Rectangles and
+        // counts keep their existing unconstrained vertex movement.
+        const point = vsnap ?? (
+          canSnapVertex && (orthoLock || shiftHeldRef.current)
+            ? orthoSnapVertexDrag(
+              drag.origPoints,
+              drag.vertexIndex,
+              cur,
+              drag.original.type === 'area' || drag.original.type === 'volume',
+            )
+            : cur
+        );
+        setSnapPoint(vsnap);
+        next = drag.origPoints.map((p, i) => (i === drag.vertexIndex ? point : p));
       } else {
-        next = translatePoints(drag.origPoints, cur.x - drag.startPt.x, cur.y - drag.startPt.y);
+        setSnapPoint(null);
+        const point = (orthoLock || shiftHeldRef.current)
+          ? orthoSnap(drag.startPt, cur)
+          : cur;
+        next = translatePoints(
+          drag.origPoints,
+          point.x - drag.startPt.x,
+          point.y - drag.startPt.y,
+        );
       }
       drag.moved = true;
       drag.lastPoints = next;
@@ -2865,7 +2912,7 @@ export default function TakeoffViewerModule({
         selfIntersecting: Boolean(patch.selfIntersecting),
       });
     },
-    [pointerToPdf],
+    [pointerToPdf, orthoLock],
   );
 
   /* ── Mouse move: edit drag, rect preview, live readout, hover ─────── */
@@ -2879,6 +2926,15 @@ export default function TakeoffViewerModule({
         return;
       }
       const pt = pointerToPdf(e);
+
+      if (pt && settingScale && scalePoints.length === 1) {
+        const point = (orthoLock || shiftHeldRef.current)
+          ? orthoSnap(scalePoints[0]!, pt)
+          : pt;
+        setLiveCursor(point);
+        setSnapPoint((cur) => (cur ? null : cur));
+        return;
+      }
 
       if ((activeTool === 'rectangle' || activeTool === 'highlight' || activeTool === 'rectarea') && rectStartPoint) {
         if (!pt) return;
@@ -2894,6 +2950,7 @@ export default function TakeoffViewerModule({
       // length and the rubber-band follows the same point a click will place.
       if (
         pt &&
+        !settingScale &&
         (activeTool === 'distance' ||
           activeTool === 'polyline' ||
           activeTool === 'area' ||
@@ -2953,7 +3010,7 @@ export default function TakeoffViewerModule({
         setHoverInfo(null);
       }
     },
-    [activeTool, rectStartPoint, pointerToPdf, handleEditDragMove, activePoints, orthoLock, liveCursor, editableOnPage, hoverInfo],
+    [activeTool, rectStartPoint, pointerToPdf, handleEditDragMove, activePoints, orthoLock, liveCursor, editableOnPage, hoverInfo, settingScale, scalePoints],
   );
 
   /** Clear the transient HUD / hover state when the pointer leaves the canvas. */

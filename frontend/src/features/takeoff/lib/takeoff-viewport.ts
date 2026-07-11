@@ -263,9 +263,10 @@ const ORTHO_STEP_RAD = Math.PI / 4;
  * Snap `cursor` so the segment `anchor -> cursor` lies on the nearest
  * multiple of 45 degrees, preserving the segment length along that axis.
  *
- * The point is projected onto the snapped direction (length = original
- * distance * cos(angle error)) rather than merely rounded, so a near-45
- * drag produces a clean diagonal whose endpoint sits exactly on the ray.
+ * The point is projected onto the snapped direction at the ORIGINAL cursor
+ * distance (the raw length, not its axis component), so a near-45 drag
+ * produces a clean diagonal whose endpoint sits exactly on the ray and the
+ * segment never shortens as it snaps.
  * Returns `anchor` unchanged for a zero-length segment.
  */
 export function orthoSnap(anchor: Point, cursor: Point): Point {

@@ -58,6 +58,22 @@ describe('orthoSnapVertexDrag', () => {
       Math.abs(snapped.y - points[0]!.y),
       5,
     );
+    // The snap is length-preserving BY DESIGN: the raw cursor distance is
+    // projected onto the snapped direction, never its axis component.
+    expect(Math.hypot(snapped.x - points[0]!.x, snapped.y - points[0]!.y)).toBeCloseTo(
+      Math.hypot(80 - points[0]!.x, 70 - points[0]!.y),
+      5,
+    );
+  });
+
+  it('preserves the raw cursor distance through an axis snap', () => {
+    // A nearly-horizontal drag (3.5 degrees off) snaps to the horizontal ray
+    // at the FULL raw distance - the segment must not shorten to its x span.
+    const anchor: Point = { x: 0, y: 0 };
+    const snapped = orthoSnap(anchor, { x: 196, y: 12 });
+
+    expect(snapped.y).toBeCloseTo(0, 5);
+    expect(snapped.x).toBeCloseTo(Math.hypot(196, 12), 5);
   });
 
   it('leaves magnet snap ahead of the ortho candidate', () => {
@@ -81,5 +97,7 @@ describe('ortho-snapped translation vector', () => {
     const dy = snapped.y - start.y;
 
     expect(Math.abs(dx)).toBeCloseTo(Math.abs(dy), 5);
+    // Length-preserving: the translation magnitude equals the raw drag.
+    expect(Math.hypot(dx, dy)).toBeCloseTo(Math.hypot(80 - 10, 65 - 10), 5);
   });
 });

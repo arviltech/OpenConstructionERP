@@ -950,6 +950,9 @@ export default function TakeoffViewerModule({
     activeVertexRef.current = null;
     setDragPreview(null);
     setSnapPoint(null);
+    // The calibration-tracked cursor would otherwise surface a HUD readout
+    // at the previous page's position until the first mouse move.
+    setLiveCursor(null);
   }, [currentPage]);
 
   /* Deselect a measurement that lives on a different page than the one
@@ -2867,30 +2870,39 @@ export default function TakeoffViewerModule({
       if (!cur) return;
       let next: Point[];
       if (drag.mode === 'vertex') {
+        const dragType = drag.original.type;
+        // Magnet gate mirrors the draw path (measure tools only); the ortho
+        // lock additionally covers cloud and arrow, exactly as it does when
+        // drawing new segments.
         const canSnapVertex =
-          drag.original.type === 'distance' ||
-          drag.original.type === 'polyline' ||
-          drag.original.type === 'area' ||
-          drag.original.type === 'volume';
-        const draggedPoint = drag.origPoints[drag.vertexIndex];
-        const snapPool = draggedPoint
-          ? snapVerticesRef.current.filter((point) => point !== draggedPoint)
-          : snapVerticesRef.current;
-        const vsnap = vertexSnapRef.current && canSnapVertex
-          ? snapToVertex(cur, snapPool, zoomRef.current || 1, VERTEX_SNAP_SCREEN_PX)
-          : null;
+          dragType === 'distance' ||
+          dragType === 'polyline' ||
+          dragType === 'area' ||
+          dragType === 'volume';
+        const canOrthoVertex = canSnapVertex || dragType === 'cloud' || dragType === 'arrow';
+        const closedShape = dragType === 'area' || dragType === 'volume' || dragType === 'cloud';
+        let vsnap: Point | null = null;
+        if (vertexSnapRef.current && canSnapVertex) {
+          // Exclude the dragged vertex AND its adjacent neighbours from the
+          // pool: snapping onto a neighbour would commit a zero-length edge.
+          // (The draw path applies the same guard by omitting the previous
+          // placed point from its pool.)
+          const n = drag.origPoints.length;
+          const excluded = new Set<Point | undefined>([
+            drag.origPoints[drag.vertexIndex],
+            closedShape ? drag.origPoints[(drag.vertexIndex + n - 1) % n] : drag.origPoints[drag.vertexIndex - 1],
+            closedShape ? drag.origPoints[(drag.vertexIndex + 1) % n] : drag.origPoints[drag.vertexIndex + 1],
+          ]);
+          const snapPool = snapVerticesRef.current.filter((point) => !excluded.has(point));
+          vsnap = snapToVertex(cur, snapPool, zoomRef.current || 1, VERTEX_SNAP_SCREEN_PX);
+        }
         // Snap precedence (issue #303, then ortho): a nearby vertex is a
         // stronger intent than the angle constraint. Otherwise the ortho lock
         // uses the dragged vertex's adjacent segment anchors. Rectangles and
         // counts keep their existing unconstrained vertex movement.
         const point = vsnap ?? (
-          canSnapVertex && (orthoLock || shiftHeldRef.current)
-            ? orthoSnapVertexDrag(
-              drag.origPoints,
-              drag.vertexIndex,
-              cur,
-              drag.original.type === 'area' || drag.original.type === 'volume',
-            )
+          canOrthoVertex && (orthoLock || shiftHeldRef.current)
+            ? orthoSnapVertexDrag(drag.origPoints, drag.vertexIndex, cur, closedShape)
             : cur
         );
         setSnapPoint(vsnap);
@@ -6177,7 +6189,7 @@ export default function TakeoffViewerModule({
                 <button
                   onClick={() => setOrthoLock((v) => !v)}
                   className={tbBtn(orthoLock, 'blue')}
-                  title={t('takeoff_viewer.ortho_lock_hint', { defaultValue: 'Constrain new segments to 0, 45 or 90 degrees (hold Shift, or toggle here)' })}
+                  title={t('takeoff_viewer.ortho_lock_hint', { defaultValue: 'Constrain segments, vertex drags, moves and calibration picks to 0, 45 or 90 degrees (hold Shift, or toggle here)' })}
                   aria-label={t('takeoff_viewer.ortho_lock', { defaultValue: 'Ortho lock' })}
                   aria-pressed={orthoLock}
                   data-testid="ortho-lock-toggle"
@@ -6187,7 +6199,7 @@ export default function TakeoffViewerModule({
                 <button
                   onClick={() => { setVertexSnap((v) => !v); setSnapPoint(null); }}
                   className={tbBtn(vertexSnap, 'blue')}
-                  title={t('takeoff_viewer.vertex_snap_hint', { defaultValue: 'Snap new points to the corners of existing measurements' })}
+                  title={t('takeoff_viewer.vertex_snap_hint', { defaultValue: 'Snap new points and dragged vertices to the corners of existing measurements' })}
                   aria-label={t('takeoff_viewer.vertex_snap', { defaultValue: 'Snap to vertices' })}
                   aria-pressed={vertexSnap}
                   data-testid="vertex-snap-toggle"

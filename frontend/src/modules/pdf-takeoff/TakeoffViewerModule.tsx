@@ -109,6 +109,7 @@ import {
   supportsVariableVertices,
   minVertices,
   type HitResult,
+  type RecomputePatch,
 } from './data/hit-test';
 import {
   SHORTCUT_LETTER,
@@ -777,7 +778,19 @@ export default function TakeoffViewerModule({
     lastPoints: Point[];
   } | null>(null);
   const [dragPreview, setDragPreview] = useState<
-    { measurementId: string; points: Point[]; label: string; selfIntersecting: boolean } | null
+    {
+      measurementId: string;
+      points: Point[];
+      label: string;
+      selfIntersecting: boolean;
+      /** The rest of the recomputed patch (value / unit / area / depth). The
+       *  completed-measurements pass repoints the dragged measurement onto the
+       *  preview, and its value label goes through `measurementLabel`, which
+       *  reads `m.value` and converts it to the user's system. `label` above is
+       *  the canonical metric string the overlay readout draws, so it cannot be
+       *  reused there without regressing an imperial user to metres mid-drag. */
+      patch: RecomputePatch;
+    } | null
   >(null);
   /** The vertex most recently grabbed / hovered on the selected
    *  measurement, so Delete can remove a vertex (when valid) instead of
@@ -1425,8 +1438,40 @@ export default function TakeoffViewerModule({
       ctx.lineWidth = 2 * dpr;
     };
 
+    /** The measurement being reshaped, repointed onto its live drag geometry.
+     *
+     *  This pass is the ONLY one that draws a measurement's true stroke width,
+     *  its area / volume fill, its value label, a polyline's per-segment and
+     *  total labels, and its annotation. The edit overlay below draws a dashed
+     *  hairline outline, vertex handles and one live readout, and nothing else.
+     *  So the drag cannot be previewed by suppressing this pass and redrawing
+     *  in the overlay: that deletes everything in the list above for as long as
+     *  the drag lasts. Repointing here instead means all of it follows the
+     *  cursor, for every type, with exactly one band on screen.
+     *
+     *  The patch carries the recomputed `value` (and `unit` / `area`), not just
+     *  the points, because the value label is produced by `measurementLabel`,
+     *  which formats `m.value` into the user's measurement system. Geometry
+     *  alone would leave a live band under a stale number. The preview's own
+     *  `label` string is canonical metric and belongs only to the overlay
+     *  readout. */
+    const previewMeasurement = (m: Measurement): Measurement => {
+      if (!dragPreview || dragPreview.measurementId !== m.id) return m;
+      const { points, patch } = dragPreview;
+      return {
+        ...m,
+        points,
+        value: patch.value,
+        unit: patch.unit ?? m.unit,
+        ...(patch.area !== undefined ? { area: patch.area } : {}),
+        ...(patch.width !== undefined ? { width: patch.width } : {}),
+        ...(patch.height !== undefined ? { height: patch.height } : {}),
+      };
+    };
+
     // Draw completed measurements on current page (respecting group visibility)
-    for (const m of measurements.filter((m) => m.page === currentPage && !hiddenGroups.has(m.group) && !(isAnnotationType(m.type) && hiddenGroups.has('__annotations__')))) {
+    for (const committed of measurements.filter((m) => m.page === currentPage && !hiddenGroups.has(m.group) && !(isAnnotationType(m.type) && hiddenGroups.has('__annotations__')))) {
+      const m = previewMeasurement(committed);
       // A per-measurement colour (set via the properties swatch) wins over the
       // group default so a recoloured measurement paints in its chosen colour
       // (issue #299); annotation markups already resolve `m.color` below.
@@ -1902,7 +1947,10 @@ export default function TakeoffViewerModule({
         ctx.globalAlpha = 1;
         ctx.setLineDash([]);
 
-        // Outline the selected shape so it reads as active.
+        // Outline the selected shape so it reads as active. This stays a plain
+        // hairline: the measurement's real band, fill and labels are drawn by
+        // the completed pass above, which is repointed onto these same preview
+        // points while a drag is live.
         if (pts.length >= 2) {
           ctx.strokeStyle = accent;
           ctx.lineWidth = 1.5 * dpr;
@@ -1927,6 +1975,7 @@ export default function TakeoffViewerModule({
             if (isClosed) ctx.closePath();
             ctx.stroke();
           }
+          ctx.globalAlpha = 1;
           ctx.setLineDash([]);
         }
 
@@ -1973,14 +2022,23 @@ export default function TakeoffViewerModule({
           ctx.stroke();
         }
 
-        // Live value readout + bowtie warning while dragging.
+        // Live value readout + bowtie warning while dragging. The readout goes
+        // through `measurementLabel`, not `preview.label`: the latter is built by
+        // `recomputeMeasurement` as the canonical METRIC string, so drawing it raw
+        // shows an imperial user metres. That was invisible while the committed
+        // label sat at the pre-drag geometry, but the repointed pass now draws the
+        // converted label on the same shape, and the two would contradict each
+        // other on screen.
         if (preview) {
           const last = pts[pts.length - 1]!;
           const lx = last.x * dpr * zoom + 10 * dpr;
           const ly = last.y * dpr * zoom - 10 * dpr;
-          if (preview.label) {
+          const previewLabel = preview.label
+            ? measurementLabel(previewMeasurement(selected), scale, measurementSystem)
+            : '';
+          if (previewLabel) {
             ctx.font = `bold ${12 * dpr}px sans-serif`;
-            const txt = preview.label;
+            const txt = previewLabel;
             const w = ctx.measureText(txt).width + 8 * dpr;
             ctx.fillStyle = isDark ? '#1e293b' : '#ffffff';
             ctx.globalAlpha = 0.9;
@@ -2939,7 +2997,7 @@ export default function TakeoffViewerModule({
       drag.moved = true;
       drag.lastPoints = next;
       const m = measurementsRef.current.find((x) => x.id === drag.measurementId);
-      const patch = m
+      const patch: RecomputePatch = m
         ? recomputeMeasurement(m, next, editScaleRef.current)
         : { value: 0, label: '', selfIntersecting: false };
       setDragPreview({
@@ -2947,6 +3005,7 @@ export default function TakeoffViewerModule({
         points: next,
         label: patch.label,
         selfIntersecting: Boolean(patch.selfIntersecting),
+        patch,
       });
     },
     [pointerToPdf, orthoLock],

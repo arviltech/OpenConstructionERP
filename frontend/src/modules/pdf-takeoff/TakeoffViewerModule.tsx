@@ -6605,6 +6605,21 @@ export default function TakeoffViewerModule({
               </div>
             )}
 
+            {/* Canvas viewport: a NON-SCROLLING positioning context wrapped around
+                the scroll region, and the anchor for every piece of canvas chrome
+                below it. That chrome cannot be anchored to the scroll region
+                itself: an absolutely positioned child of a scrolling box is laid
+                out against its padding box and still rides the content, so `top-2`
+                / `bottom-2` mean the corners of the DRAWING, not of the view. Zoom
+                in and pan, and the legend, the hints and the readout drift off
+                screen or park on top of the work with no way to move them.
+                Anchoring them to the canvas COLUMN instead would put the
+                top-anchored ones on the toolbar, so the anchor has to be this
+                wrapper, which spans exactly the visible canvas. It carries the
+                column's flex slot (`flex-1` + the fixed `min-h-[320px]` floor) and
+                passes it straight through to the container, so the definite-height
+                chain fit-to-page depends on (#306, #341) is unchanged. */}
+            <div className="relative flex flex-1 min-w-0 min-h-[320px] flex-col">
             {/* Canvas — the PDF render surface is a genuinely-needed internal
                 scroll region (drawings are far larger than any viewport).
                 `flex-1` makes it claim the height left over in the canvas
@@ -6649,46 +6664,6 @@ export default function TakeoffViewerModule({
                 onTouchEnd={handleTouchEnd}
               />
 
-              {/* Live drawing readout HUD - cursor coordinate + running
-                  segment / cumulative length while a measure tool draws.
-                  Bottom-right so it never collides with the bottom-left legend
-                  or the top tool hint. Lengths hide when the page has no
-                  scale (the helper returns null) so we never show "0 m". */}
-              {drawReadout && (
-                <div
-                  className="absolute bottom-2 right-2 z-10 rounded-lg border border-border bg-surface-primary/95 dark:bg-gray-800/95 backdrop-blur-sm shadow-lg px-3 py-2 text-[11px] font-mono text-content-secondary pointer-events-none space-y-0.5"
-                  data-testid="draw-readout"
-                >
-                  <div className="flex items-center gap-2">
-                    <span className="text-content-quaternary uppercase tracking-wide">
-                      {t('takeoff_viewer.readout_position', { defaultValue: 'Position' })}
-                    </span>
-                    <span className="tabular-nums text-content-primary">
-                      {drawReadout.cursor.x}, {drawReadout.cursor.y}
-                    </span>
-                  </div>
-                  {drawReadout.segment != null && (
-                    <div className="flex items-center gap-2">
-                      <span className="text-content-quaternary uppercase tracking-wide">
-                        {t('takeoff_viewer.readout_segment', { defaultValue: 'Segment' })}
-                      </span>
-                      <span className="tabular-nums text-content-primary">
-                        {formatQuantity(drawReadout.segment, drawReadout.unit || 'm', measurementSystem)}
-                      </span>
-                    </div>
-                  )}
-                  {drawReadout.total != null && (
-                    <div className="flex items-center gap-2">
-                      <span className="text-content-quaternary uppercase tracking-wide">
-                        {t('takeoff_viewer.readout_total', { defaultValue: 'Total' })}
-                      </span>
-                      <span className="tabular-nums text-content-primary">
-                        {formatQuantity(drawReadout.total, drawReadout.unit || 'm', measurementSystem)}
-                      </span>
-                    </div>
-                  )}
-                </div>
-              )}
 
               {/* Hover tooltip on an existing measurement (select mode) -
                   value, group and linked BOQ position. Offset from the cursor
@@ -6733,80 +6708,6 @@ export default function TakeoffViewerModule({
                   </div>
                 </div>
               )}
-              {settingScale && (
-                <div
-                  className="absolute top-2 left-2 bg-purple-500/90 text-white px-3 py-1.5 rounded-lg text-xs font-medium"
-                  data-testid="calibration-hint"
-                >
-                  {calibrationMode
-                    ? (scalePoints.length === 0
-                        ? t('takeoff_viewer.calibrate_click_first', { defaultValue: 'Calibrate: click point A on a known dimension' })
-                        : t('takeoff_viewer.calibrate_click_second', { defaultValue: 'Calibrate: click point B' }))
-                    : (scalePoints.length === 0
-                        ? t('takeoff_viewer.scale_click_first', { defaultValue: 'Click first point of known dimension' })
-                        : t('takeoff_viewer.scale_click_second', { defaultValue: 'Click second point' }))}
-                </div>
-              )}
-              {/* AI suggestions review bar (#194) — appears when Recognize has
-                  dropped unconfirmed proposals. Accept-all clears the flags so
-                  they persist; dismiss-all drops them. Per-item accept/reject
-                  lives in the measurement list below. */}
-              {suggestionCount > 0 && (
-                <div
-                  className="absolute top-2 left-1/2 -translate-x-1/2 z-10 flex items-center gap-2 rounded-full border border-violet-300/60 bg-white/95 dark:bg-gray-800/95 px-3 py-1.5 shadow-lg backdrop-blur"
-                  data-testid="suggestions-bar"
-                >
-                  <Sparkles size={14} className="text-violet-500 shrink-0" />
-                  <span className="text-xs font-medium text-content-primary whitespace-nowrap">
-                    {t('takeoff_viewer.suggestions_pending', { defaultValue: '{{n}} AI suggestions', n: suggestionCount })}
-                  </span>
-                  <button
-                    onClick={acceptAllSuggestions}
-                    className="rounded-full bg-emerald-500 px-2.5 py-1 text-[11px] font-semibold text-white hover:bg-emerald-600 transition-colors"
-                    data-testid="accept-all-suggestions"
-                  >
-                    {t('takeoff_viewer.accept_all', { defaultValue: 'Accept all' })}
-                  </button>
-                  <button
-                    onClick={dismissAllSuggestions}
-                    className="rounded-full bg-surface-secondary px-2.5 py-1 text-[11px] font-semibold text-content-secondary hover:bg-surface-tertiary transition-colors"
-                    data-testid="dismiss-all-suggestions"
-                  >
-                    {t('takeoff_viewer.dismiss_all', { defaultValue: 'Dismiss all' })}
-                  </button>
-                </div>
-              )}
-              {/* Active-tool hint banner — shows what the current tool expects.
-                  Critical for Count/Polyline/Area where users were unsure how
-                  to terminate a session (Esc) and for Calibrate workflow. The
-                  calibration-specific hint above already covers settingScale,
-                  so this branch only fires for measure/annotation tools. */}
-              {!settingScale && activeTool !== 'select' && (
-                <div
-                  className="absolute top-2 left-1/2 -translate-x-1/2 bg-oe-blue/90 text-white px-3 py-1 rounded-md text-[11px] font-medium shadow-lg pointer-events-none flex items-center gap-2"
-                  data-testid="active-tool-hint"
-                >
-                  <span>
-                    {activeTool === 'count' && t('takeoff_viewer.hint_count', { defaultValue: 'Click on each item to count.' })}
-                    {activeTool === 'distance' && t('takeoff_viewer.hint_distance', { defaultValue: 'Click two points for a distance.' })}
-                    {activeTool === 'polyline' && t('takeoff_viewer.hint_polyline', { defaultValue: 'Click points along the line.' })}
-                    {activeTool === 'area' && t('takeoff_viewer.hint_area', { defaultValue: 'Click polygon vertices.' })}
-                    {activeTool === 'volume' && t('takeoff_viewer.hint_volume', { defaultValue: 'Click area outline.' })}
-                    {activeTool === 'cloud' && t('takeoff_viewer.hint_cloud', { defaultValue: 'Click cloud outline points.' })}
-                    {activeTool === 'arrow' && t('takeoff_viewer.hint_arrow', { defaultValue: 'Click arrow start, then end.' })}
-                    {activeTool === 'rectangle' && t('takeoff_viewer.hint_rectangle', { defaultValue: 'Click two corners.' })}
-                    {activeTool === 'highlight' && t('takeoff_viewer.hint_highlight', { defaultValue: 'Drag to highlight a region.' })}
-                    {activeTool === 'text' && t('takeoff_viewer.hint_text', { defaultValue: 'Click to place a text pin.' })}
-                  </span>
-                  {(activeTool === 'count' || activeTool === 'polyline' || activeTool === 'area' || activeTool === 'volume' || activeTool === 'cloud') && (
-                    <span className="opacity-80 border-l border-white/30 pl-2">
-                      {activeTool === 'count'
-                        ? t('takeoff_viewer.hint_esc_to_finish', { defaultValue: 'Enter: new count group · Esc: switch tool' })
-                        : t('takeoff_viewer.hint_dblclick_close', { defaultValue: 'Enter or double-click: close shape · Esc: cancel' })}
-                    </span>
-                  )}
-                </div>
-              )}
               {/* Inline text input overlay for text annotation tool */}
               {showTextInput && (
                 <div
@@ -6842,105 +6743,231 @@ export default function TakeoffViewerModule({
                   />
                 </div>
               )}
-              {/* Cloud tool hint */}
-              {activeTool === 'cloud' && activePoints.length > 0 && (
-                <div className="absolute top-2 left-2 bg-orange-500/90 text-white px-3 py-1.5 rounded-lg text-xs font-medium">
-                  {t('takeoff_viewer.cloud_hint', { defaultValue: 'Click points to define cloud shape. Double-click or right-click to finish.' })}
-                </div>
-              )}
 
-              {/* Color-coded group legend — bottom-left, click row to toggle visibility. */}
-              {showLegend && legendSummaries.length > 0 && (
-                <div
-                  className={clsx(
-                    'absolute bottom-2 left-2 max-w-[240px] rounded-lg border border-border bg-surface-primary/95 dark:bg-gray-800/95 backdrop-blur-sm shadow-lg overflow-hidden',
-                    // When a measurement/annotation tool is armed, let clicks pass through to the
-                    // overlay canvas beneath — otherwise the legend swallows canvas clicks, the user
-                    // sees no mark appear, and group-visibility toggles silently hide their work.
-                    activeTool !== 'select' && 'pointer-events-none',
-                  )}
-                  data-testid="legend-overlay"
+            </div>
+
+            {/* Canvas chrome: calibration banner, suggestion pill, tool hints and
+                legend. Anchored to the canvas-viewport wrapper above, not to the
+                scroll container, so they stay in the visible corners while the
+                drawing scrolls under them (see the wrapper's comment). */}
+            {settingScale && (
+              <div
+                className="absolute top-2 left-2 bg-purple-500/90 text-white px-3 py-1.5 rounded-lg text-xs font-medium"
+                data-testid="calibration-hint"
+              >
+                {calibrationMode
+                  ? (scalePoints.length === 0
+                      ? t('takeoff_viewer.calibrate_click_first', { defaultValue: 'Calibrate: click point A on a known dimension' })
+                      : t('takeoff_viewer.calibrate_click_second', { defaultValue: 'Calibrate: click point B' }))
+                  : (scalePoints.length === 0
+                      ? t('takeoff_viewer.scale_click_first', { defaultValue: 'Click first point of known dimension' })
+                      : t('takeoff_viewer.scale_click_second', { defaultValue: 'Click second point' }))}
+              </div>
+            )}
+
+            {/* AI suggestions review bar (#194) — appears when Recognize has
+                dropped unconfirmed proposals. Accept-all clears the flags so
+                they persist; dismiss-all drops them. Per-item accept/reject
+                lives in the measurement list below. */}
+            {suggestionCount > 0 && (
+              <div
+                className="absolute top-2 left-1/2 -translate-x-1/2 z-10 flex items-center gap-2 rounded-full border border-violet-300/60 bg-white/95 dark:bg-gray-800/95 px-3 py-1.5 shadow-lg backdrop-blur"
+                data-testid="suggestions-bar"
+              >
+                <Sparkles size={14} className="text-violet-500 shrink-0" />
+                <span className="text-xs font-medium text-content-primary whitespace-nowrap">
+                  {t('takeoff_viewer.suggestions_pending', { defaultValue: '{{n}} AI suggestions', n: suggestionCount })}
+                </span>
+                <button
+                  onClick={acceptAllSuggestions}
+                  className="rounded-full bg-emerald-500 px-2.5 py-1 text-[11px] font-semibold text-white hover:bg-emerald-600 transition-colors"
+                  data-testid="accept-all-suggestions"
                 >
-                  <div className="flex items-center justify-between px-2.5 py-1.5 border-b border-border-light bg-surface-secondary/40">
-                    <span className="text-[10px] font-bold uppercase tracking-widest text-content-tertiary">
-                      {t('takeoff_viewer.legend', { defaultValue: 'Legend' })}
-                    </span>
-                    <button
-                      type="button"
-                      onClick={() => setShowLegend(false)}
-                      className="text-content-tertiary hover:text-content-primary transition-colors p-0.5"
-                      aria-label={t('takeoff_viewer.hide_legend', { defaultValue: 'Hide legend' })}
-                    >
-                      <X size={10} />
-                    </button>
-                  </div>
-                  <div className="py-1">
-                    {/* Always show hidden groups too, so users can restore them */}
-                    {(() => {
-                      // Merge: visible summaries from legendSummaries + placeholder rows for hiddenGroups that have measurements
-                      const allGroupsOnPage = new Set<string>();
-                      for (const m of pageMeasurements) allGroupsOnPage.add(m.group || 'General');
-                      const visible = new Map(legendSummaries.map((s) => [s.name, s]));
-                      const rows: Array<{ name: string; color: string; count: number; total: number; unit: string; hidden: boolean }> = [];
-                      for (const name of Array.from(allGroupsOnPage).sort()) {
-                        const summary = visible.get(name);
-                        if (summary) {
-                          rows.push({ ...summary, hidden: false });
-                        } else {
-                          const items = pageMeasurements.filter((m) => (m.group || 'General') === name);
-                          rows.push({
-                            name,
-                            color: groupColorMap[name] || '#3B82F6',
-                            count: items.length,
-                            total: items.reduce((s, it) => s + it.value, 0),
-                            unit: items.find((it) => it.unit)?.unit ?? '',
-                            hidden: true,
-                          });
-                        }
-                      }
-                      return rows.map((row) => (
-                        <button
-                          key={row.name}
-                          type="button"
-                          onClick={() => toggleGroupVisibility(row.name)}
-                          className={clsx(
-                            'w-full flex items-center gap-2 px-2.5 py-1.5 text-left transition-colors hover:bg-surface-secondary',
-                            row.hidden && 'opacity-50',
-                          )}
-                          data-testid="legend-row"
-                          data-group={row.name}
-                          data-hidden={row.hidden}
-                          title={row.hidden
-                            ? t('takeoff_viewer.show_group', { defaultValue: 'Show group' })
-                            : t('takeoff_viewer.hide_group', { defaultValue: 'Hide group' })
-                          }
-                        >
-                          <span
-                            className="h-3 w-3 rounded-full shrink-0 ring-1 ring-white/40"
-                            style={{ backgroundColor: row.color }}
-                          />
-                          <span className="flex-1 text-[11px] font-semibold text-content-primary truncate">
-                            {row.name}
-                          </span>
-                          <span className="text-[10px] font-mono text-content-tertiary tabular-nums">
-                            {row.count}
-                          </span>
-                          <span className="text-[10px] font-mono text-content-secondary tabular-nums min-w-0">
-                            {(() => {
-                              const d = convertQuantity(row.total, row.unit, measurementSystem);
-                              return formatGroupTotal(d.value, d.unit);
-                            })()}
-                          </span>
-                          {row.hidden
-                            ? <EyeOff size={10} className="text-content-tertiary shrink-0" />
-                            : <Eye size={10} className="text-content-tertiary shrink-0" />
-                          }
-                        </button>
-                      ));
-                    })()}
-                  </div>
+                  {t('takeoff_viewer.accept_all', { defaultValue: 'Accept all' })}
+                </button>
+                <button
+                  onClick={dismissAllSuggestions}
+                  className="rounded-full bg-surface-secondary px-2.5 py-1 text-[11px] font-semibold text-content-secondary hover:bg-surface-tertiary transition-colors"
+                  data-testid="dismiss-all-suggestions"
+                >
+                  {t('takeoff_viewer.dismiss_all', { defaultValue: 'Dismiss all' })}
+                </button>
+              </div>
+            )}
+
+            {/* Active-tool hint banner — shows what the current tool expects.
+                Critical for Count/Polyline/Area where users were unsure how
+                to terminate a session (Esc) and for Calibrate workflow. The
+                calibration-specific hint above already covers settingScale,
+                so this branch only fires for measure/annotation tools. */}
+            {!settingScale && activeTool !== 'select' && (
+              <div
+                className="absolute top-2 left-1/2 -translate-x-1/2 bg-oe-blue/90 text-white px-3 py-1 rounded-md text-[11px] font-medium shadow-lg pointer-events-none flex items-center gap-2"
+                data-testid="active-tool-hint"
+              >
+                <span>
+                  {activeTool === 'count' && t('takeoff_viewer.hint_count', { defaultValue: 'Click on each item to count.' })}
+                  {activeTool === 'distance' && t('takeoff_viewer.hint_distance', { defaultValue: 'Click two points for a distance.' })}
+                  {activeTool === 'polyline' && t('takeoff_viewer.hint_polyline', { defaultValue: 'Click points along the line.' })}
+                  {activeTool === 'area' && t('takeoff_viewer.hint_area', { defaultValue: 'Click polygon vertices.' })}
+                  {activeTool === 'volume' && t('takeoff_viewer.hint_volume', { defaultValue: 'Click area outline.' })}
+                  {activeTool === 'cloud' && t('takeoff_viewer.hint_cloud', { defaultValue: 'Click cloud outline points.' })}
+                  {activeTool === 'arrow' && t('takeoff_viewer.hint_arrow', { defaultValue: 'Click arrow start, then end.' })}
+                  {activeTool === 'rectangle' && t('takeoff_viewer.hint_rectangle', { defaultValue: 'Click two corners.' })}
+                  {activeTool === 'highlight' && t('takeoff_viewer.hint_highlight', { defaultValue: 'Drag to highlight a region.' })}
+                  {activeTool === 'text' && t('takeoff_viewer.hint_text', { defaultValue: 'Click to place a text pin.' })}
+                </span>
+                {(activeTool === 'count' || activeTool === 'polyline' || activeTool === 'area' || activeTool === 'volume' || activeTool === 'cloud') && (
+                  <span className="opacity-80 border-l border-white/30 pl-2">
+                    {activeTool === 'count'
+                      ? t('takeoff_viewer.hint_esc_to_finish', { defaultValue: 'Enter: new count group · Esc: switch tool' })
+                      : t('takeoff_viewer.hint_dblclick_close', { defaultValue: 'Enter or double-click: close shape · Esc: cancel' })}
+                  </span>
+                )}
+              </div>
+            )}
+
+            {/* Cloud tool hint */}
+            {activeTool === 'cloud' && activePoints.length > 0 && (
+              <div className="absolute top-2 left-2 bg-orange-500/90 text-white px-3 py-1.5 rounded-lg text-xs font-medium">
+                {t('takeoff_viewer.cloud_hint', { defaultValue: 'Click points to define cloud shape. Double-click or right-click to finish.' })}
+              </div>
+            )}
+
+            {/* Color-coded group legend — bottom-left, click row to toggle visibility. */}
+            {showLegend && legendSummaries.length > 0 && (
+              <div
+                className={clsx(
+                  'absolute bottom-2 left-2 max-w-[240px] rounded-lg border border-border bg-surface-primary/95 dark:bg-gray-800/95 backdrop-blur-sm shadow-lg overflow-hidden',
+                  // When a measurement/annotation tool is armed, let clicks pass through to the
+                  // overlay canvas beneath — otherwise the legend swallows canvas clicks, the user
+                  // sees no mark appear, and group-visibility toggles silently hide their work.
+                  activeTool !== 'select' && 'pointer-events-none',
+                )}
+                data-testid="legend-overlay"
+              >
+                <div className="flex items-center justify-between px-2.5 py-1.5 border-b border-border-light bg-surface-secondary/40">
+                  <span className="text-[10px] font-bold uppercase tracking-widest text-content-tertiary">
+                    {t('takeoff_viewer.legend', { defaultValue: 'Legend' })}
+                  </span>
+                  <button
+                    type="button"
+                    onClick={() => setShowLegend(false)}
+                    className="text-content-tertiary hover:text-content-primary transition-colors p-0.5"
+                    aria-label={t('takeoff_viewer.hide_legend', { defaultValue: 'Hide legend' })}
+                  >
+                    <X size={10} />
+                  </button>
                 </div>
-              )}
+                <div className="py-1">
+                  {/* Always show hidden groups too, so users can restore them */}
+                  {(() => {
+                    // Merge: visible summaries from legendSummaries + placeholder rows for hiddenGroups that have measurements
+                    const allGroupsOnPage = new Set<string>();
+                    for (const m of pageMeasurements) allGroupsOnPage.add(m.group || 'General');
+                    const visible = new Map(legendSummaries.map((s) => [s.name, s]));
+                    const rows: Array<{ name: string; color: string; count: number; total: number; unit: string; hidden: boolean }> = [];
+                    for (const name of Array.from(allGroupsOnPage).sort()) {
+                      const summary = visible.get(name);
+                      if (summary) {
+                        rows.push({ ...summary, hidden: false });
+                      } else {
+                        const items = pageMeasurements.filter((m) => (m.group || 'General') === name);
+                        rows.push({
+                          name,
+                          color: groupColorMap[name] || '#3B82F6',
+                          count: items.length,
+                          total: items.reduce((s, it) => s + it.value, 0),
+                          unit: items.find((it) => it.unit)?.unit ?? '',
+                          hidden: true,
+                        });
+                      }
+                    }
+                    return rows.map((row) => (
+                      <button
+                        key={row.name}
+                        type="button"
+                        onClick={() => toggleGroupVisibility(row.name)}
+                        className={clsx(
+                          'w-full flex items-center gap-2 px-2.5 py-1.5 text-left transition-colors hover:bg-surface-secondary',
+                          row.hidden && 'opacity-50',
+                        )}
+                        data-testid="legend-row"
+                        data-group={row.name}
+                        data-hidden={row.hidden}
+                        title={row.hidden
+                          ? t('takeoff_viewer.show_group', { defaultValue: 'Show group' })
+                          : t('takeoff_viewer.hide_group', { defaultValue: 'Hide group' })
+                        }
+                      >
+                        <span
+                          className="h-3 w-3 rounded-full shrink-0 ring-1 ring-white/40"
+                          style={{ backgroundColor: row.color }}
+                        />
+                        <span className="flex-1 text-[11px] font-semibold text-content-primary truncate">
+                          {row.name}
+                        </span>
+                        <span className="text-[10px] font-mono text-content-tertiary tabular-nums">
+                          {row.count}
+                        </span>
+                        <span className="text-[10px] font-mono text-content-secondary tabular-nums min-w-0">
+                          {(() => {
+                            const d = convertQuantity(row.total, row.unit, measurementSystem);
+                            return formatGroupTotal(d.value, d.unit);
+                          })()}
+                        </span>
+                        {row.hidden
+                          ? <EyeOff size={10} className="text-content-tertiary shrink-0" />
+                          : <Eye size={10} className="text-content-tertiary shrink-0" />
+                        }
+                      </button>
+                    ));
+                  })()}
+                </div>
+              </div>
+            )}
+
+
+            {/* Live drawing readout HUD - cursor coordinate + running
+                segment / cumulative length while a measure tool draws.
+                Bottom-right so it never collides with the bottom-left legend
+                or the top tool hint. Lengths hide when the page has no
+                scale (the helper returns null) so we never show "0 m". */}
+            {drawReadout && (
+              <div
+                className="absolute bottom-2 right-2 z-10 rounded-lg border border-border bg-surface-primary/95 dark:bg-gray-800/95 backdrop-blur-sm shadow-lg px-3 py-2 text-[11px] font-mono text-content-secondary pointer-events-none space-y-0.5"
+                data-testid="draw-readout"
+              >
+                <div className="flex items-center gap-2">
+                  <span className="text-content-quaternary uppercase tracking-wide">
+                    {t('takeoff_viewer.readout_position', { defaultValue: 'Position' })}
+                  </span>
+                  <span className="tabular-nums text-content-primary">
+                    {drawReadout.cursor.x}, {drawReadout.cursor.y}
+                  </span>
+                </div>
+                {drawReadout.segment != null && (
+                  <div className="flex items-center gap-2">
+                    <span className="text-content-quaternary uppercase tracking-wide">
+                      {t('takeoff_viewer.readout_segment', { defaultValue: 'Segment' })}
+                    </span>
+                    <span className="tabular-nums text-content-primary">
+                      {formatQuantity(drawReadout.segment, drawReadout.unit || 'm', measurementSystem)}
+                    </span>
+                  </div>
+                )}
+                {drawReadout.total != null && (
+                  <div className="flex items-center gap-2">
+                    <span className="text-content-quaternary uppercase tracking-wide">
+                      {t('takeoff_viewer.readout_total', { defaultValue: 'Total' })}
+                    </span>
+                    <span className="tabular-nums text-content-primary">
+                      {formatQuantity(drawReadout.total, drawReadout.unit || 'm', measurementSystem)}
+                    </span>
+                  </div>
+                )}
+              </div>
+            )}
             </div>
           </div>
 

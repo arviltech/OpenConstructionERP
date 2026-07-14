@@ -1396,7 +1396,17 @@ export default function TakeoffViewerModule({
      * the label remains legible regardless of theme.
      */
     const isDark = document.documentElement.classList.contains('dark');
-    const drawAnnotationLabel = (text: string, lx: number, ly: number, color: string) => {
+    const drawAnnotationLabel = (
+      text: string,
+      lx: number,
+      ly: number,
+      color: string,
+      // The badge normally runs RIGHT from `lx`. On a line whose value label had
+      // to be right-aligned (the line is to the right of the text), a name longer
+      // than the value would then run back across the band, so `lx` is read as the
+      // badge's right edge instead and the box grows leftward from it.
+      alignRight = false,
+    ) => {
       // Names view toggle: the name badges (and the count badge, which carries
       // the running total) are the names layer and hide together (#314).
       if (!showLabels) return;
@@ -1407,7 +1417,8 @@ export default function TakeoffViewerModule({
       const padY = 2 * dpr;
       const boxW = metrics.width + padX * 2;
       const boxH = fontSize + padY * 2;
-      const bx = lx - padX;
+      const tx = alignRight ? lx - metrics.width : lx;
+      const bx = tx - padX;
       const by = ly - fontSize - padY;
       // Semi-transparent background — white in light mode, dark-grey in dark mode
       ctx.globalAlpha = 0.82;
@@ -1420,9 +1431,61 @@ export default function TakeoffViewerModule({
       ctx.strokeRect(bx, by, boxW, boxH);
       // Text
       ctx.fillStyle = color;
-      ctx.fillText(text, lx, ly - padY);
+      ctx.fillText(text, tx, ly - padY);
       // Restore line width
       ctx.lineWidth = 2 * dpr;
+    };
+
+    /** Unit normal of a segment, pointing at whichever side is "up" on screen.
+     *  Value labels are pushed along it so they clear the line they describe: a
+     *  fixed vertical offset lands INSIDE a line carrying a real-world width (a
+     *  wall run is tens of pixels wide), where the label paints in the same
+     *  colour as the band and cannot be read. Perpendicular also fixes the
+     *  vertical-line case, where a straight-up offset never left the stroke. */
+    const upwardNormal = (ax: number, ay: number, bx: number, by: number) => {
+      const dx = bx - ax;
+      const dy = by - ay;
+      const len = Math.hypot(dx, dy);
+      if (!len) return { nx: 0, ny: -1 };
+      let nx = -dy / len;
+      let ny = dx / len;
+      if (ny > 0) {
+        nx = -nx;
+        ny = -ny;
+      }
+      return { nx, ny };
+    };
+
+    /** Which way the text runs from its anchor, given the away-from-line normal.
+     *  `right` means the line is to the RIGHT of the text, so the text has to end
+     *  at the anchor rather than start there. */
+    const labelAlign = (n: { nx: number; ny: number }): CanvasTextAlign =>
+      n.nx < -0.35 ? 'right' : n.nx > 0.35 ? 'left' : 'center';
+
+    /** Draw a value label at an anchor already pushed clear of the band, with
+     *  the text ALIGNED away from the line. Offsetting the anchor alone is not
+     *  enough: canvas text runs right from its anchor and sits on its baseline,
+     *  so a label pushed to the left of a near-vertical band still ran back
+     *  across it, and one pushed sideways still straddled it vertically.
+     *  Returns the drawn text's box edges, so a name badge can stack above it. */
+    const placeLabel = (text: string, x: number, y: number, n: { nx: number; ny: number }) => {
+      const align = labelAlign(n);
+      const baseline: CanvasTextBaseline = n.ny < -0.35 ? 'bottom' : n.ny > 0.35 ? 'top' : 'middle';
+      ctx.textAlign = align;
+      ctx.textBaseline = baseline;
+      ctx.fillText(text, x, y);
+      const w = ctx.measureText(text).width;
+      const h = parseFloat(ctx.font) || 12 * dpr;
+      // Canvas text state is global; restore it so every other label, badge and
+      // readout keeps drawing from its own top-left as it always has.
+      ctx.textAlign = 'left';
+      ctx.textBaseline = 'alphabetic';
+      const left = align === 'right' ? x - w : align === 'center' ? x - w / 2 : x;
+      return {
+        left,
+        right: left + w,
+        top: baseline === 'bottom' ? y - h : baseline === 'top' ? y : y - h / 2,
+      };
     };
 
     // Draw completed measurements on current page (respecting group visibility)
@@ -1449,6 +1512,10 @@ export default function TakeoffViewerModule({
           ? m.strokeWidthReal * ownPixelsPerUnit
           : (m.strokeWidth ?? 2);
       ctx.lineWidth = baseStrokeWidth * dpr * zoom;
+      /** Half the painted band, in device pixels. Every value label clears this
+       *  before adding its own gap, so a wide line's label sits beside the band
+       *  instead of on top of it. Zero-ish on a hairline, so nothing moves. */
+      const bandHalfPx = (baseStrokeWidth * dpr * zoom) / 2;
       // AI suggestions (#194) render translucent + dashed until the user
       // confirms them, so they read as proposals rather than committed work.
       ctx.globalAlpha = m.suggested ? 0.5 : 1.0;
@@ -1470,14 +1537,29 @@ export default function TakeoffViewerModule({
         ctx.globalAlpha = m.suggested ? 0.5 : 1;
         // Measurement value label (converted to the user's system; stored
         // metric per D-TKC-016).
-        const mx = ((p0.x + p1.x) / 2) * dpr * zoom;
-        const my = ((p0.y + p1.y) / 2) * dpr * zoom - 8 * dpr;
+        const n = upwardNormal(p0.x, p0.y, p1.x, p1.y);
+        const off = bandHalfPx + 8 * dpr;
+        const mx = ((p0.x + p1.x) / 2) * dpr * zoom + n.nx * off;
+        const my = ((p0.y + p1.y) / 2) * dpr * zoom + n.ny * off;
         ctx.font = `${12 * dpr}px sans-serif`;
         // Values view toggle: the computed dimension text is the values layer,
         // hidden independently of the name badges (#314).
-        if (showDimensions) ctx.fillText(measurementLabel(m, scale, measurementSystem), mx, my);
-        // Annotation near midpoint (offset above the value label)
-        drawAnnotationLabel(m.annotation, mx, my - 14 * dpr, color);
+        const vbox = showDimensions
+          ? placeLabel(measurementLabel(m, scale, measurementSystem), mx, my, n)
+          : null;
+        // Name badge stacks directly above the value label. Pushing it along the
+        // normal instead would land it ON the value label whenever the normal is
+        // horizontal, which is exactly the near-vertical line case. It stacks on
+        // the label's far edge, not always its left one, so a name longer than the
+        // value cannot grow back over the band.
+        const vRight = labelAlign(n) === 'right';
+        drawAnnotationLabel(
+          m.annotation,
+          vbox ? (vRight ? vbox.right : vbox.left) : mx,
+          (vbox ? vbox.top : my) - 4 * dpr,
+          color,
+          vRight,
+        );
       }
 
       if (m.type === 'polyline' && m.points.length >= 2) {
@@ -1503,10 +1585,12 @@ export default function TakeoffViewerModule({
             const pb = m.points[i + 1]!;
             const segDist = pixelDistance(pa.x, pa.y, pb.x, pb.y);
             const segReal = toRealDistance(segDist, scale);
-            const smx = ((pa.x + pb.x) / 2) * dpr * zoom;
-            const smy = ((pa.y + pb.y) / 2) * dpr * zoom - 6 * dpr;
+            const sn = upwardNormal(pa.x, pa.y, pb.x, pb.y);
+            const soff = bandHalfPx + 6 * dpr;
+            const smx = ((pa.x + pb.x) / 2) * dpr * zoom + sn.nx * soff;
+            const smy = ((pa.y + pb.y) / 2) * dpr * zoom + sn.ny * soff;
             ctx.font = `${10 * dpr}px sans-serif`;
-            ctx.fillText(formatQuantity(segReal, 'm', measurementSystem), smx, smy);
+            placeLabel(formatQuantity(segReal, 'm', measurementSystem), smx, smy, sn);
           }
         }
         // Draw points
@@ -1517,11 +1601,23 @@ export default function TakeoffViewerModule({
         }
         // Total label near first point
         const fp = m.points[0]!;
-        const totalLx = fp.x * dpr * zoom;
-        const totalLy = fp.y * dpr * zoom - 12 * dpr;
+        const sp = m.points[1]!;
+        const tn = upwardNormal(fp.x, fp.y, sp.x, sp.y);
+        const toff = bandHalfPx + 12 * dpr;
+        const totalLx = fp.x * dpr * zoom + tn.nx * toff;
+        const totalLy = fp.y * dpr * zoom + tn.ny * toff;
         ctx.font = `${12 * dpr}px sans-serif`;
-        if (showDimensions) ctx.fillText(measurementLabel(m, scale, measurementSystem), totalLx, totalLy);
-        drawAnnotationLabel(m.annotation, totalLx, totalLy - 14 * dpr, color);
+        const tbox = showDimensions
+          ? placeLabel(measurementLabel(m, scale, measurementSystem), totalLx, totalLy, tn)
+          : null;
+        const tRight = labelAlign(tn) === 'right';
+        drawAnnotationLabel(
+          m.annotation,
+          tbox ? (tRight ? tbox.right : tbox.left) : totalLx,
+          (tbox ? tbox.top : totalLy) - 4 * dpr,
+          color,
+          tRight,
+        );
       }
 
       if ((m.type === 'area' || m.type === 'volume') && m.points.length >= 3) {

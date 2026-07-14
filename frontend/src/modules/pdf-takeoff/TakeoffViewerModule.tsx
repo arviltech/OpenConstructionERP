@@ -680,6 +680,7 @@ export default function TakeoffViewerModule({
   // Measurement groups
   const [activeGroup, setActiveGroup] = useState('General');
   const [hiddenGroups, setHiddenGroups] = useState<Set<string>>(new Set());
+  const [hiddenMeasurements, setHiddenMeasurements] = useState<Set<string>>(new Set());
   const [collapsedGroups, setCollapsedGroups] = useState<Set<string>>(new Set());
   // Custom per-group colours (issue #313). Merged over the built-in colours so a
   // user-defined group paints in its chosen colour on the canvas, in the legend
@@ -1426,7 +1427,7 @@ export default function TakeoffViewerModule({
     };
 
     // Draw completed measurements on current page (respecting group visibility)
-    for (const m of measurements.filter((m) => m.page === currentPage && !hiddenGroups.has(m.group) && !(isAnnotationType(m.type) && hiddenGroups.has('__annotations__')))) {
+    for (const m of measurements.filter((m) => m.page === currentPage && !hiddenGroups.has(m.group) && !hiddenMeasurements.has(m.id) && !(isAnnotationType(m.type) && hiddenGroups.has('__annotations__')))) {
       // A per-measurement colour (set via the properties swatch) wins over the
       // group default so a recoloured measurement paints in its chosen colour
       // (issue #299); annotation markups already resolve `m.color` below.
@@ -1892,7 +1893,12 @@ export default function TakeoffViewerModule({
      * cursor, with a live value readout and an amber bowtie warning. */
     if (activeTool === 'select') {
       const selected = measurements.find(
-        (m) => m.id === selectedMeasurementId && m.page === currentPage,
+        (m) =>
+          m.id === selectedMeasurementId &&
+          m.page === currentPage &&
+          !hiddenMeasurements.has(m.id) &&
+          !hiddenGroups.has(m.group) &&
+          !(isAnnotationType(m.type) && hiddenGroups.has('__annotations__')),
       );
       if (selected) {
         const preview = dragPreview?.measurementId === selected.id ? dragPreview : null;
@@ -2040,7 +2046,7 @@ export default function TakeoffViewerModule({
       ctx.stroke();
       ctx.restore();
     }
-  }, [measurements, activePoints, currentPage, zoom, settingScale, scalePoints, activeTool, hiddenGroups, scale, pageScales, annotationColor, rectStartPoint, isDraggingRect, selectedMeasurementId, dragPreview, liveCursor, panning, searchMatches, activeMatchIdx, measurementSystem, snapPoint, showLabels, showDimensions, renderNonce, groupColorMap]);
+  }, [measurements, activePoints, currentPage, zoom, settingScale, scalePoints, activeTool, hiddenGroups, hiddenMeasurements, scale, pageScales, annotationColor, rectStartPoint, isDraggingRect, selectedMeasurementId, dragPreview, liveCursor, panning, searchMatches, activeMatchIdx, measurementSystem, snapPoint, showLabels, showDimensions, renderNonce, groupColorMap]);
 
   /* ── Canvas click handler ────────────────────────────────────────── */
 
@@ -2184,18 +2190,19 @@ export default function TakeoffViewerModule({
   // Snap-target vertices (issue #303): every vertex of a visible, committed
   // measurement on the current page, hit-tested against the draw cursor when
   // vertex snap is on. Read through a ref inside the pointer handlers so it
-  // never enters their dependency arrays. Suggestions + hidden groups are
+  // never enters their dependency arrays. Suggestions + hidden items are
   // excluded (you cannot connect to a corner you cannot see).
   const snapVertices = useMemo(() => {
     const out: Point[] = [];
     for (const m of measurements) {
       if (m.page !== currentPage || m.suggested) continue;
       if (hiddenGroups.has(m.group)) continue;
+      if (hiddenMeasurements.has(m.id)) continue;
       if (isAnnotationType(m.type) && hiddenGroups.has('__annotations__')) continue;
       for (const p of m.points) out.push(p);
     }
     return out;
-  }, [measurements, currentPage, hiddenGroups]);
+  }, [measurements, currentPage, hiddenGroups, hiddenMeasurements]);
   const snapVerticesRef = useRef(snapVertices);
   snapVerticesRef.current = snapVertices;
   // handleCanvasDblClick is defined below handleCanvasClick, so the click path
@@ -2696,6 +2703,8 @@ export default function TakeoffViewerModule({
   currentPageRef.current = currentPage;
   const hiddenGroupsRef = useRef(hiddenGroups);
   hiddenGroupsRef.current = hiddenGroups;
+  const hiddenMeasurementsRef = useRef(hiddenMeasurements);
+  hiddenMeasurementsRef.current = hiddenMeasurements;
   const selectedMeasurementIdRef = useRef(selectedMeasurementId);
   selectedMeasurementIdRef.current = selectedMeasurementId;
 
@@ -2716,11 +2725,13 @@ export default function TakeoffViewerModule({
   const editableOnPage = useCallback((): Measurement[] => {
     const page = currentPageRef.current;
     const hidden = hiddenGroupsRef.current;
+    const hiddenIds = hiddenMeasurementsRef.current;
     return measurementsRef.current.filter(
       (m) =>
         m.page === page &&
         !m.suggested &&
         !hidden.has(m.group) &&
+        !hiddenIds.has(m.id) &&
         !(isAnnotationType(m.type) && hidden.has('__annotations__')),
     );
   }, []);
@@ -3578,10 +3589,10 @@ export default function TakeoffViewerModule({
   /** Summaries for the color-coded legend overlay (bottom-left of canvas). */
   const legendSummaries = useMemo(
     () => computeGroupSummaries(
-      pageMeasurements.filter((m) => !hiddenGroups.has(m.group)),
+      pageMeasurements.filter((m) => !hiddenGroups.has(m.group) && !hiddenMeasurements.has(m.id)),
       groupColorMap,
     ),
-    [pageMeasurements, hiddenGroups, groupColorMap],
+    [pageMeasurements, hiddenGroups, hiddenMeasurements, groupColorMap],
   );
 
   /** Currently-selected measurement object (null if nothing selected / target deleted). */
@@ -3779,6 +3790,23 @@ export default function TakeoffViewerModule({
     });
   }, []);
 
+  /** Toggle visibility of an individual measurement */
+  const toggleMeasurementVisibility = useCallback((id: string) => {
+    const willHide = !hiddenMeasurements.has(id);
+    setHiddenMeasurements((prev) => {
+      const next = new Set(prev);
+      if (next.has(id)) {
+        next.delete(id);
+      } else {
+        next.add(id);
+      }
+      return next;
+    });
+    if (willHide) {
+      setSelectedMeasurementId((selectedId) => selectedId === id ? null : selectedId);
+    }
+  }, [hiddenMeasurements]);
+
   /** Toggle collapse of a measurement group in sidebar */
   const toggleGroupCollapse = useCallback((groupName: string) => {
     setCollapsedGroups((prev) => {
@@ -3911,6 +3939,7 @@ export default function TakeoffViewerModule({
         pdfDoc,
         measurements,
         hiddenGroups,
+        hiddenMeasurements,
         scale,
         groupColorMap,
         projectName: exportProjectName,
@@ -3936,7 +3965,7 @@ export default function TakeoffViewerModule({
     } finally {
       setIsExportingPdf(false);
     }
-  }, [pdfDoc, measurements, hiddenGroups, scale, exportProjectName, addToast, t, measurementSystem, groupColorMap]);
+  }, [pdfDoc, measurements, hiddenGroups, hiddenMeasurements, scale, exportProjectName, addToast, t, measurementSystem, groupColorMap]);
 
   /** Export measurements + summary to an .xlsx workbook. */
   const handleExportExcel = useCallback(async () => {
@@ -6850,7 +6879,14 @@ export default function TakeoffViewerModule({
               )}
 
               {/* Color-coded group legend — bottom-left, click row to toggle visibility. */}
-              {showLegend && legendSummaries.length > 0 && (
+              {/* Gated on the page having measurements, NOT on `legendSummaries` being
+                  non-empty. `legendSummaries` excludes hidden groups and (since the
+                  per-measurement toggle) individually hidden measurements, so gating on
+                  it unmounted the whole legend the moment the last visible group went
+                  dark - taking with it the very rows that restore a hidden group. The
+                  row builder below reconstructs a row for every group on the page,
+                  hidden or not, so it has everything it needs. */}
+              {showLegend && pageMeasurements.length > 0 && (
                 <div
                   className={clsx(
                     'absolute bottom-2 left-2 max-w-[240px] rounded-lg border border-border bg-surface-primary/95 dark:bg-gray-800/95 backdrop-blur-sm shadow-lg overflow-hidden',
@@ -6887,14 +6923,24 @@ export default function TakeoffViewerModule({
                         if (summary) {
                           rows.push({ ...summary, hidden: false });
                         } else {
-                          const items = pageMeasurements.filter((m) => (m.group || 'General') === name);
+                          // No visible summary for this group. Either the GROUP is hidden
+                          // (placeholder row, full count, so it can be restored), or the group
+                          // is visible but every member is individually hidden - in which case
+                          // the row must NOT read as a hidden group, or its eye toggle would
+                          // hide the group instead of restoring anything.
+                          const groupHidden = hiddenGroups.has(name);
+                          const items = pageMeasurements.filter(
+                            (m) =>
+                              (m.group || 'General') === name &&
+                              (groupHidden || !hiddenMeasurements.has(m.id)),
+                          );
                           rows.push({
                             name,
                             color: groupColorMap[name] || '#3B82F6',
                             count: items.length,
                             total: items.reduce((s, it) => s + it.value, 0),
                             unit: items.find((it) => it.unit)?.unit ?? '',
-                            hidden: true,
+                            hidden: groupHidden,
                           });
                         }
                       }
@@ -8019,6 +8065,7 @@ export default function TakeoffViewerModule({
                               onClick={() => setSelectedMeasurementId((cur) => (cur === m.id ? null : m.id))}
                               className={clsx(
                                 'rounded-sm px-2 py-1 group/item transition-all cursor-pointer',
+                                hiddenMeasurements.has(m.id) && 'opacity-50',
                                 selectedMeasurementId === m.id
                                   ? 'bg-oe-blue/10 border border-oe-blue/40'
                                   : 'bg-surface-secondary/70 hover:bg-surface-secondary border border-transparent hover:border-border-light',
@@ -8086,6 +8133,22 @@ export default function TakeoffViewerModule({
                                   )}
                                 </div>
                                 <div className="flex items-center gap-0.5 shrink-0">
+                                  <button
+                                    onClick={(e) => { e.stopPropagation(); toggleMeasurementVisibility(m.id); }}
+                                    className="p-0.5 rounded hover:bg-surface-primary text-content-tertiary transition-colors shrink-0"
+                                    aria-label={hiddenMeasurements.has(m.id)
+                                      ? t('takeoff_viewer.show_measurement', { defaultValue: 'Show measurement' })
+                                      : t('takeoff_viewer.hide_measurement', { defaultValue: 'Hide measurement' })
+                                    }
+                                    title={hiddenMeasurements.has(m.id)
+                                      ? t('takeoff_viewer.show_measurement', { defaultValue: 'Show measurement' })
+                                      : t('takeoff_viewer.hide_measurement', { defaultValue: 'Hide measurement' })
+                                    }
+                                    data-testid="measurement-visibility-toggle"
+                                    data-hidden={hiddenMeasurements.has(m.id)}
+                                  >
+                                    {hiddenMeasurements.has(m.id) ? <EyeOff size={12} /> : <Eye size={12} />}
+                                  </button>
                                   {/* Accept / reject AI suggestions inline (#194). */}
                                   {m.suggested && (
                                     <>

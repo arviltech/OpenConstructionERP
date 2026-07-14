@@ -13,8 +13,7 @@
  *   - `buildTakeoffWorkbook` — produces a 2-sheet exceljs workbook
  *     ("Measurements" + "Summary") with group-coloured subtotal rows.
  *
- * Both flavours respect group visibility — only measurements whose
- * group is **not** in `hiddenGroups` are baked / exported, matching the
+ * PDF exports respect group and per-measurement visibility, matching the
  * live canvas overlay's filter rule in `TakeoffViewerModule.tsx`.
  *
  * The renderer in `renderMeasurementsOnCanvas` is a verbatim port of
@@ -64,6 +63,8 @@ export interface PdfExportContext extends ExportContext {
   measurements: Measurement[];
   /** Groups hidden in the UI — excluded from the bake. */
   hiddenGroups: ReadonlySet<string>;
+  /** Measurements hidden in the UI — excluded from the bake. */
+  hiddenMeasurements: ReadonlySet<string>;
   /** Calibrated scale (defines unit suffix on labels). */
   scale: ScaleConfig;
   /** Group → color map (matches `MEASUREMENT_GROUPS` in the viewer). */
@@ -208,12 +209,13 @@ export function renderMeasurementsOnCanvas(
     scale: ScaleConfig;
     groupColorMap: Readonly<Record<string, string>>;
     hiddenGroups: ReadonlySet<string>;
+    hiddenMeasurements: ReadonlySet<string>;
     /** Measurement system for the baked value labels. Defaults to metric
      *  (uses the stored metric labels verbatim). */
     measurementSystem?: MeasurementSystem;
   },
 ): void {
-  const { pageNumber, dpr, zoom, scale, groupColorMap, hiddenGroups } = options;
+  const { pageNumber, dpr, zoom, scale, groupColorMap, hiddenGroups, hiddenMeasurements } = options;
   const system: MeasurementSystem = options.measurementSystem ?? 'metric';
   ctx.lineWidth = 2 * dpr;
   ctx.font = `${12 * dpr}px sans-serif`;
@@ -244,6 +246,7 @@ export function renderMeasurementsOnCanvas(
     (m) =>
       m.page === pageNumber &&
       !hiddenGroups.has(m.group) &&
+      !hiddenMeasurements.has(m.id) &&
       !(isAnnotationType(m.type) && hiddenGroups.has('__annotations__')),
   );
 
@@ -516,10 +519,12 @@ export function renderMeasurementsOnCanvas(
 export function selectAnnotatedPages(
   measurements: Measurement[],
   hiddenGroups: ReadonlySet<string>,
+  hiddenMeasurements: ReadonlySet<string>,
 ): number[] {
   const pages = new Set<number>();
   for (const m of measurements) {
     if (hiddenGroups.has(m.group)) continue;
+    if (hiddenMeasurements.has(m.id)) continue;
     if (isAnnotationType(m.type) && hiddenGroups.has('__annotations__')) continue;
     pages.add(m.page);
   }
@@ -543,7 +548,7 @@ export async function buildTakeoffPdf(ctx: PdfExportContext): Promise<JsPDF> {
   const { default: JsPdfCtor } = await import('jspdf');
   const renderScale = ctx.renderScale ?? 1.5;
   const jpegQuality = ctx.jpegQuality ?? 0.85;
-  const pageNumbers = selectAnnotatedPages(ctx.measurements, ctx.hiddenGroups);
+  const pageNumbers = selectAnnotatedPages(ctx.measurements, ctx.hiddenGroups, ctx.hiddenMeasurements);
 
   // Honour the constructor signature; defaults overridden per page below.
   const pdf = new JsPdfCtor({ orientation: 'portrait', unit: 'pt', format: 'a4' });
@@ -574,6 +579,7 @@ export async function buildTakeoffPdf(ctx: PdfExportContext): Promise<JsPDF> {
       scale: ctx.scale,
       groupColorMap: ctx.groupColorMap,
       hiddenGroups: ctx.hiddenGroups,
+      hiddenMeasurements: ctx.hiddenMeasurements,
       measurementSystem: ctx.measurementSystem,
     });
 
@@ -627,6 +633,7 @@ function renderPdfSummary(pdf: JsPDF, ctx: PdfExportContext): void {
   const visibleMeasurements = ctx.measurements.filter(
     (m) =>
       !ctx.hiddenGroups.has(m.group) &&
+      !ctx.hiddenMeasurements.has(m.id) &&
       !(isAnnotationType(m.type) && ctx.hiddenGroups.has('__annotations__')),
   );
   const rows = summariseByGroupType(visibleMeasurements, ctx.groupColorMap);

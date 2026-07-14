@@ -9,6 +9,7 @@ import {
   buildTakeoffPdf,
   buildTakeoffWorkbook,
   EXCEL_COLUMNS,
+  renderMeasurementsOnCanvas,
   selectAnnotatedPages,
   summariseByGroupType,
 } from '../../../features/takeoff/lib/takeoff-export';
@@ -203,9 +204,45 @@ describe('selectAnnotatedPages + buildTakeoffPdf page count', () => {
   it('returns only pages with at least one visible measurement', () => {
     // Hide "General" → only Structural/area on page 2 should remain.
     const hidden = new Set(['General']);
-    expect(selectAnnotatedPages(SAMPLE_MEASUREMENTS, hidden)).toEqual([2]);
+    expect(selectAnnotatedPages(SAMPLE_MEASUREMENTS, hidden, new Set())).toEqual([2]);
     // All visible → pages 1, 2, 3.
-    expect(selectAnnotatedPages(SAMPLE_MEASUREMENTS, new Set())).toEqual([1, 2, 3]);
+    expect(selectAnnotatedPages(SAMPLE_MEASUREMENTS, new Set(), new Set())).toEqual([1, 2, 3]);
+  });
+
+  it('omits a page whose only measurement is individually hidden', () => {
+    expect(selectAnnotatedPages([SAMPLE_MEASUREMENTS[2]!], new Set(), new Set(['m3']))).toEqual([]);
+  });
+
+  it('excludes individually-hidden measurements from the canvas renderer', () => {
+    const ctx = {
+      lineWidth: 0,
+      font: '',
+      strokeStyle: '#000000',
+      fillStyle: '#000000',
+      globalAlpha: 1,
+      fillRect: vi.fn(),
+      strokeRect: vi.fn(),
+      beginPath: vi.fn(),
+      moveTo: vi.fn(),
+      lineTo: vi.fn(),
+      stroke: vi.fn(),
+      fillText: vi.fn(),
+      measureText: () => ({ width: 50 } as TextMetrics),
+    } as unknown as CanvasRenderingContext2D;
+
+    renderMeasurementsOnCanvas(ctx, SAMPLE_MEASUREMENTS, {
+      pageNumber: 1,
+      dpr: 1,
+      zoom: 1,
+      scale: { pixelsPerUnit: 100, unitLabel: 'm' },
+      groupColorMap: GROUP_COLORS,
+      hiddenGroups: new Set(),
+      hiddenMeasurements: new Set(['m1']),
+    });
+
+    const labels = vi.mocked(ctx.fillText).mock.calls.map(([text]) => text);
+    expect(labels).toContain('Door width');
+    expect(labels).not.toContain('Wall run');
   });
 
   it('produces a PDF with one page per visible-annotated page + 1 summary page', async () => {
@@ -227,6 +264,7 @@ describe('selectAnnotatedPages + buildTakeoffPdf page count', () => {
       pdfDoc: fakeDoc,
       measurements: SAMPLE_MEASUREMENTS,
       hiddenGroups: new Set(),
+      hiddenMeasurements: new Set(),
       scale: { pixelsPerUnit: 100, unitLabel: 'm' },
       groupColorMap: GROUP_COLORS,
       projectName: 'Test Project',
@@ -235,6 +273,34 @@ describe('selectAnnotatedPages + buildTakeoffPdf page count', () => {
     // 3 annotated source pages + 1 summary page = 4.
     expect(pdf.getNumberOfPages()).toBe(4);
     expect(fakeDoc.getPage).toHaveBeenCalledTimes(3);
+  });
+
+  it('excludes individually-hidden measurements from PDF summary rows', async () => {
+    const fakePage = {
+      getViewport: ({ scale }: { scale: number }) => ({
+        width: 100 * scale,
+        height: 100 * scale,
+      }),
+      render: () => ({ promise: Promise.resolve() }),
+    };
+    const fakeDoc = {
+      numPages: 3,
+      getPage: vi.fn(async () => fakePage),
+    } as unknown as import('pdfjs-dist').PDFDocumentProxy;
+
+    const pdf = await buildTakeoffPdf({
+      pdfDoc: fakeDoc,
+      measurements: SAMPLE_MEASUREMENTS,
+      hiddenGroups: new Set(['Structural', '__annotations__']),
+      hiddenMeasurements: new Set(['m1']),
+      scale: { pixelsPerUnit: 100, unitLabel: 'm' },
+      groupColorMap: GROUP_COLORS,
+      projectName: 'Test Project',
+    });
+    const pageCommands = pdf.internal.pages.flat().join('\n');
+
+    expect(pageCommands).toContain('(2.25) Tj');
+    expect(pageCommands).not.toContain('(7.75) Tj');
   });
 });
 

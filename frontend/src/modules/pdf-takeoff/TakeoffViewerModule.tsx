@@ -2880,6 +2880,13 @@ export default function TakeoffViewerModule({
             lastPoints: [...m.points],
           };
         }
+        // The hover card is positioned from `handleCanvasMouseMove`, whose drag
+        // branch returns above the block that moves it, so the card freezes over
+        // the shape being reshaped. Clear it here, as the drag is ARMED, rather
+        // than on the first move: a press that is held without moving, or
+        // released without moving, would otherwise strand the card on screen.
+        // `finishDrag` does not read it, so nothing downstream needs it.
+        setHoverInfo(null);
         e.preventDefault();
         return;
       }
@@ -2959,6 +2966,9 @@ export default function TakeoffViewerModule({
       // A pan in progress is driven by the window listener; ignore here.
       if (panRef.current) return;
       if (dragRef.current) {
+        // This branch returns above the block that repositions the hover card, so
+        // the card is cleared where the drag is armed (see handleCanvasMouseDown).
+        // An ordinary move after the drag re-hovers it.
         handleEditDragMove(e);
         return;
       }

@@ -1006,6 +1006,10 @@ export default function TakeoffViewerModule({
     setSettingScale(false);
     setCalibrationMode(false);
     setScalePoints([]);
+    // A page switch also cancels an armed calibration pick; clear its tracked
+    // cursor/snap so a stale draw overlay does not reappear on the new page.
+    setLiveCursor(null);
+    setSnapPoint(null);
     // Abandon any in-flight in-canvas edit drag so it cannot bleed onto the
     // new page (#194).
     dragRef.current = null;
@@ -1990,10 +1994,13 @@ export default function TakeoffViewerModule({
     // linear / polygon tools, so an ortho-locked segment is visible before
     // the click lands. The cursor is already ortho-snapped upstream. A faint
     // closing edge back to the first vertex hints the area a polygon will
-    // enclose. Skipped while panning (the cursor is not placing points).
+    // enclose. Skipped while panning (the cursor is not placing points), and
+    // during a calibration pick, where liveCursor tracks the calibration
+    // cursor and would otherwise drag the rubber-band to it.
     if (
       liveCursor &&
       !panning &&
+      !settingScale &&
       activePoints.length > 0 &&
       (activeTool === 'distance' ||
         activeTool === 'polyline' ||
@@ -2022,8 +2029,10 @@ export default function TakeoffViewerModule({
       ctx.restore();
     }
 
-    // In-progress rectangle/highlight drag preview
-    if (rectStartPoint && isDraggingRect && activePoints.length === 1) {
+    // In-progress rectangle/highlight drag preview (suppressed during a
+    // calibration pick, like the rubber-band above, so a frozen in-progress
+    // shape doesn't linger under the calibration line).
+    if (rectStartPoint && isDraggingRect && activePoints.length === 1 && !settingScale) {
       const p0 = rectStartPoint;
       const p1 = activePoints[0]!;
       const rx = Math.min(p0.x, p1.x) * dpr * zoom;
@@ -2232,8 +2241,9 @@ export default function TakeoffViewerModule({
 
     // Snap-to-vertex cue (issue #303): a ring at the existing vertex the
     // in-progress point will lock onto, so the connection is visible before the
-    // click lands. Drawn last so it sits above everything.
-    if (snapPoint) {
+    // click lands. Drawn last so it sits above everything. Suppressed during a
+    // calibration pick, with the other draw-path previews.
+    if (snapPoint && !settingScale) {
       ctx.save();
       ctx.setLineDash([]);
       ctx.globalAlpha = 1;
@@ -2508,6 +2518,11 @@ export default function TakeoffViewerModule({
           const np1 = newPoints[1]!;
           const dist = pixelDistance(np0.x, np0.y, np1.x, np1.y);
           setSettingScale(false);
+          // The pick is done: clear the calibration-tracked cursor/snap so the
+          // drawing rubber-band and readout do not reappear at the stale
+          // snapped point behind the dialog before the next mouse move.
+          setLiveCursor(null);
+          setSnapPoint(null);
           if (calibrationMode) {
             // Route to the new multi-unit calibration dialog.
             setCalibrationPixels(dist);
@@ -3400,6 +3415,10 @@ export default function TakeoffViewerModule({
     setCalibrationMode(true);
     setSettingScale(true);
     setScalePoints([]);
+    // Drop drawing-path overlay state so a mid-draw cursor/snap indicator
+    // does not stay frozen on screen while the pick is in progress.
+    setLiveCursor(null);
+    setSnapPoint(null);
   }, []);
 
   /** User confirmed the calibration dialog — persist the new scale.
@@ -3729,12 +3748,13 @@ export default function TakeoffViewerModule({
   const drawReadout: DrawReadout | null = useMemo(() => {
     if (
       !liveCursor ||
+      settingScale ||
       !(activeTool === 'distance' || activeTool === 'polyline' || activeTool === 'area' || activeTool === 'volume')
     ) {
       return null;
     }
     return computeDrawReadout(activePoints, liveCursor, scale);
-  }, [liveCursor, activeTool, activePoints, scale]);
+  }, [liveCursor, settingScale, activeTool, activePoints, scale]);
 
   /** The measurement currently hovered in select mode (for the tooltip). */
   const hoverMeasurement = useMemo(
@@ -5794,9 +5814,13 @@ export default function TakeoffViewerModule({
     // Switching tools also cancels an in-progress two-click calibration pick,
     // mirroring the Escape handler. Without this the calibration stays armed
     // and its click branch eats the next click on the newly selected tool (#344).
+    // Clear the calibration-tracked cursor/snap too, so the new tool's drawing
+    // overlays do not resume at the stale calibration point.
     setSettingScale(false);
     setCalibrationMode(false);
     setScalePoints([]);
+    setLiveCursor(null);
+    setSnapPoint(null);
     if (isAnnotationTool(tool)) {
       setAnnotationColor(DEFAULT_ANNOTATION_COLORS[tool]);
     }
@@ -5854,10 +5878,14 @@ export default function TakeoffViewerModule({
           return;
         }
         if (calibrationMode || settingScale) {
-          // Bail out of two-click pick mode cleanly.
+          // Bail out of two-click pick mode cleanly, including the
+          // calibration-tracked cursor/snap so the drawing rubber-band and
+          // readout do not reappear at a stale point before the next move.
           setCalibrationMode(false);
           setSettingScale(false);
           setScalePoints([]);
+          setLiveCursor(null);
+          setSnapPoint(null);
           return;
         }
         // Leave sticky pan mode (#316), mirroring a second click on the toggle.
@@ -6790,7 +6818,7 @@ export default function TakeoffViewerModule({
               <div className={TB_GROUP}>
                 {/* Scale */}
                 <button
-                  onClick={() => { setCalibrationMode(false); setSettingScale(true); setScalePoints([]); }}
+                  onClick={() => { setCalibrationMode(false); setSettingScale(true); setScalePoints([]); setLiveCursor(null); setSnapPoint(null); }}
                   className={tbBtn(settingScale && !calibrationMode, 'purple')}
                   title={t('takeoff_viewer.set_scale', { defaultValue: 'Set scale' })}
                   aria-label={t('takeoff_viewer.set_scale', { defaultValue: 'Set scale' })}

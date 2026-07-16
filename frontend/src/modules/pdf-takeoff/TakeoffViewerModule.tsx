@@ -6809,7 +6809,7 @@ export default function TakeoffViewerModule({
                   data-testid="calibrate-button"
                 >
                   <Ruler size={15} />
-                  <span className="hidden sm:inline">{t('takeoff_viewer.calibrate', { defaultValue: 'Calibrate' })}</span>
+                  <span className="hidden sm:inline">{t('takeoff_viewer.calibrate_short', { defaultValue: 'Calibrate' })}</span>
                 </button>
               </div>
 

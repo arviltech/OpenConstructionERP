@@ -1190,6 +1190,7 @@ const resource = {
     "takeoff.redo": "Redo",
     "takeoff.undo": "Undo",
     "takeoff_viewer.calibrate": "Calibrate scale (two-click)",
+    "takeoff_viewer.calibrate_short": "Calibrate",
     "takeoff_viewer.group_color": "Group color",
     "takeoff_viewer.rename_group": "Rename group",
     "takeoff_viewer.rename_group_prompt": "Rename group",

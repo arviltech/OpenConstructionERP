@@ -1604,3 +1604,21 @@ html.oe-nav-pending body {
 @keyframes oe-nav-spin {
   to { transform: rotate(360deg); }
 }
+
+/* Takeoff toolbar: collapse the view-toggle button text (Pages/Legend/Names/
+   Values/Panel) to icon-only when the toolbar itself gets narrow, so its top
+   row stops wrapping to a second line. This is a CONTAINER query on the toolbar,
+   not a viewport breakpoint: opening a w-72 side panel or the thumbnail rail
+   shrinks the toolbar without changing the viewport width, so a `hidden
+   sm:inline` viewport media query can never see the tight state and the labels
+   stay, forcing the wrap. The 1024px threshold sits between the panels-open
+   toolbar width (about 870px, where the row wraps) and the panels-closed width
+   (about 1150px, where it fits). */
+.oe-takeoff-toolbar {
+  container-type: inline-size;
+}
+@container (max-width: 1024px) {
+  .oe-takeoff-toolbar .oe-tb-view-label {
+    display: none;
+  }
+}

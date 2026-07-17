@@ -6431,7 +6431,7 @@ export default function TakeoffViewerModule({
                 document actions; row 2 = scale + drawing tools. Related
                 controls sit in soft "segmented" tracks instead of being
                 separated by hairline dividers. */}
-            <div className="flex shrink-0 flex-col gap-1.5 rounded-lg border border-border bg-surface-primary p-1.5 shadow-xs">
+            <div className="oe-takeoff-toolbar flex shrink-0 flex-col gap-1.5 rounded-lg border border-border bg-surface-primary p-1.5 shadow-xs">
               <div className="flex items-center gap-1 flex-wrap">
               {/* Page nav - prev / jump / next in one segmented track. */}
               <div className={TB_GROUP}>
@@ -6676,7 +6676,7 @@ export default function TakeoffViewerModule({
                       data-testid="thumbnails-toggle"
                     >
                       <Layers size={15} />
-                      <span className="hidden sm:inline">{t('takeoff_viewer.thumbnails', { defaultValue: 'Pages' })}</span>
+                      <span className="oe-tb-view-label">{t('takeoff_viewer.thumbnails', { defaultValue: 'Pages' })}</span>
                     </button>
                   )}
                   <button
@@ -6688,7 +6688,7 @@ export default function TakeoffViewerModule({
                     data-testid="legend-toggle"
                   >
                     <List size={15} />
-                    <span className="hidden sm:inline">{t('takeoff_viewer.legend', { defaultValue: 'Legend' })}</span>
+                    <span className="oe-tb-view-label">{t('takeoff_viewer.legend', { defaultValue: 'Legend' })}</span>
                   </button>
                   {/* Declutter toggles: hide the on-canvas name badges and the
                       dimension values independently; geometry stays visible and
@@ -6702,7 +6702,7 @@ export default function TakeoffViewerModule({
                     data-testid="names-toggle"
                   >
                     <Type size={15} />
-                    <span className="hidden sm:inline">{t('takeoff_viewer.names', { defaultValue: 'Names' })}</span>
+                    <span className="oe-tb-view-label">{t('takeoff_viewer.names', { defaultValue: 'Names' })}</span>
                   </button>
                   <button
                     onClick={() => setShowDimensions((v) => !v)}
@@ -6713,7 +6713,7 @@ export default function TakeoffViewerModule({
                     data-testid="values-toggle"
                   >
                     <Hash size={15} />
-                    <span className="hidden sm:inline">{t('takeoff_viewer.values', { defaultValue: 'Values' })}</span>
+                    <span className="oe-tb-view-label">{t('takeoff_viewer.values', { defaultValue: 'Values' })}</span>
                   </button>
                   {/* Collapse the right sidebar for a larger drawing viewport (#315). */}
                   <button
@@ -6725,7 +6725,7 @@ export default function TakeoffViewerModule({
                     data-testid="sidebar-toggle"
                   >
                     <PanelRight size={15} />
-                    <span className="hidden sm:inline">{t('takeoff_viewer.panel', { defaultValue: 'Panel' })}</span>
+                    <span className="oe-tb-view-label">{t('takeoff_viewer.panel', { defaultValue: 'Panel' })}</span>
                   </button>
                 </div>
 

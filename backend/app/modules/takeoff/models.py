@@ -23,6 +23,7 @@ from sqlalchemy import (
     Numeric,
     String,
     Text,
+    text,
 )
 from sqlalchemy.orm import Mapped, mapped_column
 
@@ -82,6 +83,22 @@ class TakeoffDocument(Base):
     """Uploaded PDF document for quantity takeoff."""
 
     __tablename__ = "oe_takeoff_document"
+    __table_args__ = (
+        # One takeoff document per (project, source Project-Files document).
+        # ``POST /documents/from-source`` is an unlocked find-or-create, so two
+        # concurrent opens of the same source could both miss the SELECT and
+        # insert, minting duplicates that strand measurements on whichever row
+        # the reader does not resolve to. This partial unique index makes the
+        # duplicate impossible in the database. Scoped to a non-null
+        # ``source_document_id`` so direct uploads (null source) stay unconstrained.
+        Index(
+            "uq_takeoff_document_project_source",
+            "project_id",
+            "source_document_id",
+            unique=True,
+            postgresql_where=text("source_document_id IS NOT NULL"),
+        ),
+    )
 
     filename: Mapped[str] = mapped_column(String(500), nullable=False)
     pages: Mapped[int] = mapped_column(Integer, nullable=False, default=0)

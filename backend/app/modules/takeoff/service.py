@@ -19,6 +19,7 @@ from pathlib import Path
 from typing import Any
 
 from fastapi import HTTPException, status
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.modules.takeoff.models import AiTakeoffRun, TakeoffDocument, TakeoffMeasurement
@@ -1408,7 +1409,19 @@ class TakeoffService:
             source_document_id=source_document_id,
         )
 
-        return await self.repo.create(doc)
+        try:
+            return await self.repo.create(doc)
+        except IntegrityError:
+            # The (project_id, source_document_id) partial unique index rejected
+            # this row: a concurrent from-source request already created the
+            # takeoff document for this source. Remove the PDF we just wrote so
+            # the lost race leaves no orphan file, then let the caller resolve to
+            # the winner. Suppress any OSError from the unlink (not just
+            # FileNotFoundError) so a cleanup hiccup can't mask the
+            # IntegrityError the caller must see to roll back and re-select.
+            with contextlib.suppress(OSError):
+                file_path.unlink()
+            raise
 
     async def get_or_create_takeoff_from_source(
         self,
@@ -1438,14 +1451,27 @@ class TakeoffService:
         )
         if existing is not None:
             return existing
-        return await self.upload_document(
-            filename=filename,
-            content=content,
-            size_bytes=size_bytes,
-            owner_id=owner_id,
-            project_id=source_project_id,
-            source_document_id=source_document_id,
-        )
+        try:
+            return await self.upload_document(
+                filename=filename,
+                content=content,
+                size_bytes=size_bytes,
+                owner_id=owner_id,
+                project_id=source_project_id,
+                source_document_id=source_document_id,
+            )
+        except IntegrityError:
+            # A concurrent from-source request won the race between our SELECT
+            # and INSERT, and the partial unique index rejected our duplicate.
+            # Roll back the poisoned transaction and return the winner. If no
+            # row is found the violation was not the uniqueness one, so re-raise.
+            await self.session.rollback()
+            winner = await self.repo.get_by_source_document_id(
+                source_document_id, project_id=uuid.UUID(source_project_id)
+            )
+            if winner is None:
+                raise
+            return winner
 
     async def get_document(self, doc_id: str) -> TakeoffDocument | None:
         return await self.repo.get_by_id(uuid.UUID(doc_id))

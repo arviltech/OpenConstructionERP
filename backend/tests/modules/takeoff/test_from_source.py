@@ -12,9 +12,10 @@ no real PDF work or subprocess runs.
 from __future__ import annotations
 
 import uuid
-from unittest.mock import MagicMock
+from unittest.mock import AsyncMock, MagicMock
 
 import pytest
+from sqlalchemy.exc import IntegrityError
 
 from app.modules.takeoff import service as takeoff_service
 
@@ -141,3 +142,101 @@ async def test_created_row_carries_source_and_is_indexable(_stub_parse):
 
     found = await svc.repo.get_by_source_document_id(src_id, project_id=uuid.UUID(project_id))
     assert found is doc
+
+
+@pytest.mark.asyncio
+async def test_lost_race_rolls_back_and_returns_winner(_stub_parse):
+    """A concurrent open that wins between our SELECT and INSERT: the partial
+    unique index rejects our duplicate, so we roll back and return the winner."""
+    svc = _make_service()
+    svc.session.rollback = AsyncMock()
+    src_id = str(uuid.uuid4())
+    project_id = str(uuid.uuid4())
+    winner = MagicMock()
+    winner.source_document_id = src_id
+    winner.project_id = uuid.UUID(project_id)
+
+    calls = {"select": 0}
+
+    async def _get(source_document_id, *, project_id):
+        calls["select"] += 1
+        # First lookup (before create) sees nothing; after the IntegrityError +
+        # rollback, the winner the concurrent request committed is visible.
+        return None if calls["select"] == 1 else winner
+
+    async def _create(_doc):
+        raise IntegrityError("INSERT", {}, Exception("uq_takeoff_document_project_source"))
+
+    svc.repo.get_by_source_document_id = _get
+    svc.repo.create = _create
+
+    result = await svc.get_or_create_takeoff_from_source(
+        source_document_id=src_id,
+        source_project_id=project_id,
+        filename="plan.pdf",
+        content=b"%PDF-1.4\nbody",
+        size_bytes=13,
+        owner_id=str(uuid.uuid4()),
+    )
+
+    assert result is winner
+    svc.session.rollback.assert_awaited_once()
+    assert calls["select"] == 2  # initial miss, then re-select the winner
+
+
+@pytest.mark.asyncio
+async def test_integrity_error_without_winner_reraises(_stub_parse):
+    """An IntegrityError that is not the uniqueness race (no winner appears on
+    re-select) must propagate, not be swallowed."""
+    svc = _make_service()
+    svc.session.rollback = AsyncMock()
+    src_id = str(uuid.uuid4())
+    project_id = str(uuid.uuid4())
+
+    async def _get(source_document_id, *, project_id):
+        return None  # never a winner
+
+    async def _create(_doc):
+        raise IntegrityError("INSERT", {}, Exception("some_other_constraint"))
+
+    svc.repo.get_by_source_document_id = _get
+    svc.repo.create = _create
+
+    with pytest.raises(IntegrityError):
+        await svc.get_or_create_takeoff_from_source(
+            source_document_id=src_id,
+            source_project_id=project_id,
+            filename="plan.pdf",
+            content=b"%PDF-1.4\nbody",
+            size_bytes=13,
+            owner_id=str(uuid.uuid4()),
+        )
+    svc.session.rollback.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_upload_document_unlinks_written_pdf_on_integrity_error(_stub_parse, tmp_path):
+    """The lost race must leave no orphan PDF: when the partial unique index
+    rejects the insert, upload_document deletes the file it just wrote. Pins the
+    cleanup so removing that handler fails here (the re-select tests above pass
+    with or without it, because the IntegrityError propagates either way)."""
+    svc = _make_service()
+
+    async def _create(_doc):
+        raise IntegrityError("INSERT", {}, Exception("uq_takeoff_document_project_source"))
+
+    svc.repo.create = _create
+
+    with pytest.raises(IntegrityError):
+        await svc.upload_document(
+            filename="plan.pdf",
+            content=b"%PDF-1.4\nbody",
+            size_bytes=13,
+            owner_id=str(uuid.uuid4()),
+            project_id=str(uuid.uuid4()),
+            source_document_id=str(uuid.uuid4()),
+        )
+
+    # _stub_parse redirects the upload dir to tmp_path / "td"; the written PDF
+    # must be gone after the rejected insert.
+    assert list((tmp_path / "td").glob("*.pdf")) == []

@@ -747,6 +747,42 @@ describe('useMeasurementPersistence', () => {
     expect(loaded.map((m) => m.id)).toEqual(['m2']);
   });
 
+  // ── Hydrate order: reload must match in-session stacking ──
+  it('hydrates measurements in ascending creation order although the API lists newest-first', async () => {
+    const { takeoffApi } = await import('@/features/takeoff/api');
+    const row = (n: number, iso: string) => ({
+      id: `srv-${n}`, project_id: PROJECT, document_id: DOC, page: 1,
+      type: 'distance', points: [{ x: 0, y: 0 }, { x: 10 * n, y: 0 }],
+      group_name: 'General', group_color: '#3B82F6', annotation: `D${n}`,
+      measurement_value: n, measurement_unit: 'm', depth: null,
+      volume: null, perimeter: null, count_value: null,
+      scale_pixels_per_unit: 100, linked_boq_position_id: null,
+      is_deduction: false, metadata: { frontend_id: `m${n}`, scale_calibrated: false },
+      created_at: iso,
+    });
+    // Server order is created_at DESC (newest first), as the API returns it.
+    (takeoffApi.list as unknown as ReturnType<typeof vi.fn>).mockResolvedValueOnce([
+      row(3, '2026-07-19T10:02:00Z'),
+      row(2, '2026-07-19T10:01:00Z'),
+      row(1, '2026-07-19T10:00:00Z'),
+    ]);
+    const setM = vi.fn();
+    const setPS = vi.fn();
+    renderHook(() =>
+      useMeasurementPersistence({
+        fileName: 'res.pdf', documentId: DOC, measurements: [],
+        setMeasurements: setM, pageScales: basePageScales, setPageScales: setPS,
+        scale: defaultScale, projectId: PROJECT,
+      }),
+    );
+
+    await waitFor(() => expect(setM).toHaveBeenCalled());
+    // Hydrate restores ascending creation order (oldest first, newest last),
+    // matching the in-session append order so stacking survives a reload.
+    const loaded = setM.mock.calls[setM.mock.calls.length - 1]![0] as Array<{ id: string }>;
+    expect(loaded.map((m) => m.id)).toEqual(['m1', 'm2', 'm3']);
+  });
+
   // ── #282 B: a non-geometry edit (group/colour/annotation) PATCHes ──
   it('syncs a non-geometry edit of a synced measurement (issue #282)', async () => {
     vi.useFakeTimers();

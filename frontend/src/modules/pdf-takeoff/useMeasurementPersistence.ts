@@ -821,9 +821,21 @@ export function useMeasurementPersistence({
           if (!cancelled && serverData.length > 0) {
             hasPersistedRef.current = true;
             setSyncedToServer(true);
+            // The API lists newest-first (created_at DESC), but in-session
+            // creates append newest-LAST, and array order is the only z-order
+            // the canvas has - hydrating in fetch order inverts the stacking
+            // on every reload. Restore ascending creation order so reload
+            // matches the in-session order; the id tie-break keeps rows with
+            // an identical created_at deterministic across reloads (the
+            // original within-tie sequence is not recoverable from the API).
+            const ordered = [...serverData].sort(
+              (a, b) =>
+                String(a.created_at ?? '').localeCompare(String(b.created_at ?? '')) ||
+                String(a.id).localeCompare(String(b.id)),
+            );
             // Drop rows we have locally deleted but not yet synced (#282).
             const pending = pendingDeletesRef.current;
-            const mapped = serverData
+            const mapped = ordered
               .map(fromApiFormat)
               .filter((m) => !(m.serverId && pending.has(m.serverId)));
 

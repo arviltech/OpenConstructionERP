@@ -60,6 +60,7 @@ import {
   AlertTriangle,
   Search,
   Boxes,
+  GripVertical,
 } from 'lucide-react';
 import clsx from 'clsx';
 import { useToastStore } from '../../stores/useToastStore';
@@ -148,7 +149,21 @@ import {
 import {
   computeGroupSummaries,
   formatGroupTotal,
+  moveMeasurementToGroup,
 } from '../../features/takeoff/lib/takeoff-groups';
+import {
+  insertCanonical,
+  isGroupOnly,
+  planGroupMove,
+  sortCanonical,
+} from '../../features/takeoff/lib/order-key';
+import {
+  bandOrder,
+  planGroupReorder,
+  planRowReorder,
+  presentationOrder,
+  type GroupOrderEntry,
+} from '../../features/takeoff/lib/group-order';
 import {
   effectiveQuantity,
   hasQuantityFactor,
@@ -340,6 +355,19 @@ interface Measurement {
   suggested?: boolean;
   /** Recognition confidence 0..1, present only on AI-sourced measurements. */
   confidence?: number;
+  /** ISO creation stamp for the canonical ordering tie-break: stamped by
+   *  every in-session producer via newMeasurementStamp(), mapped from
+   *  `created_at` on hydrate. Never sent to the server. */
+  createdAt?: string;
+  /** Persisted z/list-order key (`metadata.order_key`). Keyless rows sort
+   *  after every keyed row, in creation order (append semantics); a key is
+   *  assigned only when a group move places the row. See lib/order-key.ts. */
+  orderKey?: string;
+  /** This row's GROUP's persisted band-order triple, mirrored onto every
+   *  member row (groups have no server entity). Re-stamped to the destination
+   *  band's entry (or cleared) on every group change — a stale triple riding
+   *  along would re-teach the map the old band's key for the new group. */
+  groupOrder?: GroupOrderEntry;
 }
 
 /* ── Annotation Colors ───────────────────────────────────────────── */
@@ -391,6 +419,14 @@ const BASE_GROUP_COLORS: Record<string, string> = Object.fromEntries(
   MEASUREMENT_GROUPS.map((g) => [g.name, g.color]),
 );
 
+/** Creation stamp for every measurement produced in-session — the ONE seam
+ *  (draw tools, count, duplicate, page-replicate, AI suggestions) feeding
+ *  the canonical ordering tie-break, so no producer can miss it. Suggestions
+ *  are stamped at INSERT time; accepting one only clears its flag. */
+function newMeasurementStamp(): string {
+  return new Date().toISOString();
+}
+
 /** Describes a reversible measurement operation for the undo stack. */
 type UndoOperation =
   | { kind: 'add_point'; tool: MeasureTool; point: Point }
@@ -401,7 +437,26 @@ type UndoOperation =
   // In-canvas geometry edit (#194 Feature 1). Both kinds snapshot the
   // pre-edit measurement so undo restores the exact prior geometry +
   // derived value; redo replays the post-edit snapshot.
-  | { kind: 'edit_geometry'; measurementId: string; previousMeasurement: Measurement; nextMeasurement: Measurement };
+  | { kind: 'edit_geometry'; measurementId: string; previousMeasurement: Measurement; nextMeasurement: Measurement }
+  // Cross-group move with persisted placement. previousOrderKey is the row's
+  // post-materialization key at its OLD position (never undefined for a
+  // placed move), so undo restores group + key and the comparator re-places
+  // the row — no stored index, which would go stale under edits.
+  | {
+      kind: 'move_measurement';
+      measurementId: string;
+      previousGroup: string;
+      previousOrderKey?: string;
+      /** The row's mirrored band triple before a CROSS-band move (`null` =
+       *  carried none); `undefined` = same-band move, leave the triple alone.
+       *  Undo restores it so the row never re-teaches the map a stale key. */
+      previousGroupOrder?: GroupOrderEntry | null;
+    }
+  // Group band move. previousEntry is the band's post-phase-1 entry (a REAL
+  // key — a first drag materializes keys before the move, so undo never
+  // restores a keyless state). The restore re-applies that key at a FRESH
+  // rev via the stamp+queue path, so recency semantics stay monotone.
+  | { kind: 'move_group'; group: string; previousEntry: GroupOrderEntry };
 
 /* ── Component ─────────────────────────────────────────────────────── */
 
@@ -731,6 +786,14 @@ export default function TakeoffViewerModule({
   // Session-scoped, like hiddenGroups (not persisted).
   const [hiddenMeasurements, setHiddenMeasurements] = useState<Set<string>>(new Set());
   const [collapsedGroups, setCollapsedGroups] = useState<Set<string>>(new Set());
+  const [draggingMeasurementId, setDraggingMeasurementId] = useState<string | null>(null);
+  const [dropTargetGroup, setDropTargetGroup] = useState<string | null>(null);
+  // Group band drag (slice 2): dragging a group header reorders whole bands.
+  const [draggingGroupName, setDraggingGroupName] = useState<string | null>(null);
+  const [groupDropTarget, setGroupDropTarget] = useState<string | null>(null);
+  // Row slot drag (slice 2): dropping a row between two rows re-slots it
+  // (same or different band); dropping on a band header keeps append.
+  const [rowDropTarget, setRowDropTarget] = useState<{ id: string; position: 'before' | 'after' } | null>(null);
   // Custom per-group colours (issue #313). Merged over the built-in colours so a
   // user-defined group paints in its chosen colour on the canvas, in the legend
   // and in exports. Loaded/saved per document below.
@@ -921,7 +984,7 @@ export default function TakeoffViewerModule({
   // PDF / Excel export in-flight flags (drive button spinner state).
   const [isExportingPdf, setIsExportingPdf] = useState(false);
   const [isExportingXlsx, setIsExportingXlsx] = useState(false);
-  const { hasPersistedData, saveNow, clearPersisted, syncing, syncedToServer, registerDeletion, hasUnsavedChanges } = useMeasurementPersistence({
+  const { hasPersistedData, saveNow, clearPersisted, syncing, syncedToServer, registerDeletion, hasUnsavedChanges, persistOrderKeys, groupOrderKeys, applyGroupOrder, persistRowGroupOrder, mintGroupOrderRev, groupOrderActor } = useMeasurementPersistence({
     fileName,
     // Stable document UUID drives both the localStorage key and server sync
     // (issue #238); a null id (fresh local drop) keeps everything local.
@@ -1604,8 +1667,23 @@ export default function TakeoffViewerModule({
       };
     })();
 
-    // Draw completed measurements on current page (respecting group visibility)
-    for (const rawM of measurements.filter((m) => m.page === currentPage && !hiddenGroups.has(m.group) && !hiddenMeasurements.has(m.id) && !(isAnnotationType(m.type) && hiddenGroups.has('__annotations__')))) {
+    // Draw completed measurements on current page (respecting group
+    // visibility) in three z-planes: committed rows in REVERSED band-major
+    // presentation order (sidebar top = painted last = frontmost), then
+    // annotations in their own pass (flat canonical order among themselves,
+    // so a band drag never z-shuffles a co-grouped callout), then AI
+    // suggestions topmost so accept/reject review stays visible regardless
+    // of band position.
+    const visibleOnPage = measurements.filter((m) => m.page === currentPage && !hiddenGroups.has(m.group) && !hiddenMeasurements.has(m.id) && !(isAnnotationType(m.type) && hiddenGroups.has('__annotations__')));
+    const paintSequence = [
+      ...presentationOrder(
+        visibleOnPage.filter((m) => !isAnnotationType(m.type) && !m.suggested),
+        groupOrderKeys,
+      ).reverse(),
+      ...visibleOnPage.filter((m) => isAnnotationType(m.type) && !m.suggested),
+      ...visibleOnPage.filter((m) => m.suggested),
+    ];
+    for (const rawM of paintSequence) {
       // Repoint the dragged measurement to its live geometry (#357); the rest of
       // the loop then draws the band / labels / dots from the cursor position.
       const m = previewMeasurement && previewMeasurement.id === rawM.id ? previewMeasurement : rawM;
@@ -2275,7 +2353,7 @@ export default function TakeoffViewerModule({
       ctx.stroke();
       ctx.restore();
     }
-  }, [measurements, activePoints, currentPage, zoom, settingScale, scalePoints, activeTool, hiddenGroups, hiddenMeasurements, scale, pageScales, annotationColor, rectStartPoint, isDraggingRect, selectedMeasurementId, dragPreview, liveCursor, panning, searchMatches, activeMatchIdx, measurementSystem, snapPoint, showLabels, showDimensions, renderNonce, groupColorMap]);
+  }, [measurements, activePoints, currentPage, zoom, settingScale, scalePoints, activeTool, hiddenGroups, hiddenMeasurements, scale, pageScales, annotationColor, rectStartPoint, isDraggingRect, selectedMeasurementId, dragPreview, liveCursor, panning, searchMatches, activeMatchIdx, measurementSystem, snapPoint, showLabels, showDimensions, renderNonce, groupColorMap, groupOrderKeys]);
 
   /* ── Canvas click handler ────────────────────────────────────────── */
 
@@ -2578,6 +2656,7 @@ export default function TakeoffViewerModule({
           const realDist = toRealDistance(dist, scale);
           const newMeasurement: Measurement = {
             id: `m_${Date.now()}`,
+            createdAt: newMeasurementStamp(),
             type: 'distance',
             points: newPoints,
             value: realDist,
@@ -2633,6 +2712,7 @@ export default function TakeoffViewerModule({
           const newId = `m_${Date.now()}`;
           const newMeasurement: Measurement = {
             id: newId,
+            createdAt: newMeasurementStamp(),
             type: 'count',
             points: [point],
             value: 1,
@@ -2662,6 +2742,7 @@ export default function TakeoffViewerModule({
         if (newPoints.length === 2) {
           const newMeasurement: Measurement = {
             id: `m_${Date.now()}`,
+            createdAt: newMeasurementStamp(),
             type: 'arrow',
             points: newPoints,
             value: 0,
@@ -2699,6 +2780,7 @@ export default function TakeoffViewerModule({
           // Second click — complete rectangle
           const newMeasurement: Measurement = {
             id: `m_${Date.now()}`,
+            createdAt: newMeasurementStamp(),
             type: activeTool,
             points: [rectStartPoint, point],
             value: 0,
@@ -2744,6 +2826,7 @@ export default function TakeoffViewerModule({
           const realPerim = toRealDistance(perimPx, scale);
           const newMeasurement: Measurement = {
             id: `m_${Date.now()}`,
+            createdAt: newMeasurementStamp(),
             type: 'area',
             points: corners,
             value: realArea,
@@ -2789,6 +2872,7 @@ export default function TakeoffViewerModule({
       const totalReal = toRealDistance(totalPx, scale);
       const newMeasurement: Measurement = {
         id: `m_${Date.now()}`,
+        createdAt: newMeasurementStamp(),
         type: 'polyline',
         points: [...pts],
         value: totalReal,
@@ -2812,6 +2896,7 @@ export default function TakeoffViewerModule({
       const realPerim = toRealDistance(perimPx, scale);
       const newMeasurement: Measurement = {
         id: `m_${Date.now()}`,
+        createdAt: newMeasurementStamp(),
         type: 'area',
         points: [...pts],
         value: realArea,
@@ -2840,6 +2925,7 @@ export default function TakeoffViewerModule({
     if (activeTool === 'cloud' && pts.length >= 3) {
       const newMeasurement: Measurement = {
         id: `m_${Date.now()}`,
+        createdAt: newMeasurementStamp(),
         type: 'cloud',
         points: [...pts],
         value: 0,
@@ -2880,6 +2966,7 @@ export default function TakeoffViewerModule({
     const volume = realArea * depth;
     const newMeasurement: Measurement = {
       id: `m_${Date.now()}`,
+      createdAt: newMeasurementStamp(),
       type: 'volume',
       points: [...pendingVolumePoints],
       value: volume,
@@ -2954,6 +3041,8 @@ export default function TakeoffViewerModule({
   hiddenMeasurementsRef.current = hiddenMeasurements;
   const selectedMeasurementIdRef = useRef(selectedMeasurementId);
   selectedMeasurementIdRef.current = selectedMeasurementId;
+  const groupOrderKeysRef = useRef(groupOrderKeys);
+  groupOrderKeysRef.current = groupOrderKeys;
 
   /** Convert a pointer event to PDF user units. Mirrors the create-path
    *  inversion exactly: divide by `zoom` only, never by `dpr` (the overlay
@@ -2965,15 +3054,18 @@ export default function TakeoffViewerModule({
     return { x: (e.clientX - rect.left) / z, y: (e.clientY - rect.top) / z };
   }, []);
 
-  /** Measurements visible on the current page (z-order = draw order), used
-   *  for select-mode hit-testing. Last drawn is on top, so we scan in
-   *  reverse for the topmost hit. Excludes hidden groups + AI suggestions
-   *  (those have their own accept/reject affordances). */
+  /** Measurements visible on the current page in TOPMOST-FIRST order, used
+   *  for select-mode hit-testing: annotations paint in their own pass above
+   *  committed rows (latest-drawn on top), and committed rows paint in
+   *  reversed band-major presentation order (sidebar top = frontmost), so
+   *  the hit scan mirrors that — annotations newest-first, then the
+   *  presentation projection forward. Excludes hidden groups + AI
+   *  suggestions (those have their own accept/reject affordances). */
   const editableOnPage = useCallback((): Measurement[] => {
     const page = currentPageRef.current;
     const hidden = hiddenGroupsRef.current;
     const hiddenM = hiddenMeasurementsRef.current;
-    return measurementsRef.current.filter(
+    const visible = measurementsRef.current.filter(
       (m) =>
         m.page === page &&
         !m.suggested &&
@@ -2982,6 +3074,12 @@ export default function TakeoffViewerModule({
         !hiddenM.has(m.id) &&
         !(isAnnotationType(m.type) && hidden.has('__annotations__')),
     );
+    const annotations = visible.filter((m) => isAnnotationType(m.type));
+    const committed = visible.filter((m) => !isAnnotationType(m.type));
+    return [
+      ...annotations.reverse(),
+      ...presentationOrder(committed, groupOrderKeysRef.current),
+    ];
   }, []);
 
   /** Apply a committed geometry edit to a measurement: recompute its value
@@ -3085,12 +3183,12 @@ export default function TakeoffViewerModule({
       const selId = selectedMeasurementIdRef.current;
 
       // Prefer the already-selected measurement so its handles win even when
-      // another shape overlaps; otherwise scan top-to-bottom (reverse z).
+      // another shape overlaps; otherwise scan top-to-bottom (editableOnPage
+      // already returns topmost-first).
       const ordered: Measurement[] = [];
       const sel = onPage.find((m) => m.id === selId);
       if (sel) ordered.push(sel);
-      for (let i = onPage.length - 1; i >= 0; i--) {
-        const m = onPage[i]!;
+      for (const m of onPage) {
         if (m.id !== selId) ordered.push(m);
       }
 
@@ -3309,8 +3407,8 @@ export default function TakeoffViewerModule({
         const z = zoomRef.current || 1;
         const onPage = editableOnPage();
         let foundId: string | null = null;
-        for (let i = onPage.length - 1; i >= 0; i--) {
-          const m = onPage[i]!;
+        // editableOnPage returns topmost-first; the first hit is the top one.
+        for (const m of onPage) {
           if (hitTest(pt, m, z, m.id === selectedMeasurementIdRef.current)) {
             foundId = m.id;
             break;
@@ -3394,6 +3492,7 @@ export default function TakeoffViewerModule({
     }
     const newMeasurement: Measurement = {
       id: `m_${Date.now()}`,
+      createdAt: newMeasurementStamp(),
       type: 'text',
       points: [textInputPos],
       value: 0,
@@ -3855,24 +3954,29 @@ export default function TakeoffViewerModule({
     [measurements],
   );
 
-  /** Group page measurements by their group name */
+  /** Group page measurements by their group name, bands in the persisted
+   *  band-major presentation order (key insertion order carries it to the
+   *  sidebar's Object.entries iteration). */
   const groupedPageMeasurements = useMemo(() => {
     const groups: Record<string, Measurement[]> = {};
-    for (const m of pageMeasurements) {
+    for (const m of presentationOrder(pageMeasurements, groupOrderKeys)) {
       const g = m.group || 'General';
       if (!groups[g]) groups[g] = [];
       groups[g]!.push(m);
     }
     return groups;
-  }, [pageMeasurements]);
+  }, [pageMeasurements, groupOrderKeys]);
 
-  /** Summaries for the color-coded legend overlay (bottom-left of canvas). */
+  /** Summaries for the color-coded legend overlay (bottom-left of canvas),
+   *  rows in the persisted band order so the legend mirrors the sidebar. */
   const legendSummaries = useMemo(
     () => computeGroupSummaries(
       pageMeasurements.filter((m) => !hiddenGroups.has(m.group) && !hiddenMeasurements.has(m.id)),
       groupColorMap,
+      undefined,
+      bandOrder(measurements, groupOrderKeys),
     ),
-    [pageMeasurements, hiddenGroups, hiddenMeasurements, groupColorMap],
+    [pageMeasurements, hiddenGroups, hiddenMeasurements, groupColorMap, measurements, groupOrderKeys],
   );
 
   /* ── Draggable legend (#358) ─────────────────────────────────────── */
@@ -4004,6 +4108,118 @@ export default function TakeoffViewerModule({
     [selectedMeasurementId],
   );
 
+  // Cross-group move with persisted placement — the ONE order-aware path
+  // both the sidebar drag handler and the Properties Group dropdown use.
+  // The planner decides: a target group with no member on the moved row's
+  // page is a pure group retarget (no keys); otherwise the row re-slots
+  // after the target group's last same-page member, the plan's key
+  // assignments are applied to state, and the sequential order flush
+  // persists them (phase 1 order-preserving, then the move, moved row last).
+  /** A row landing in `group` must carry that band's current triple — or
+   *  none when the band is keyless: its old band's triple riding along would
+   *  re-teach the map the old band's key for the NEW group via fold-back,
+   *  silently reordering bands. */
+  const withGroupOrderOf = useCallback((m: Measurement, entry: GroupOrderEntry | null): Measurement => {
+    if (entry) return { ...m, groupOrder: entry };
+    if (!m.groupOrder) return m;
+    const { groupOrder: _stale, ...rest } = m;
+    return rest;
+  }, []);
+
+  const handleMoveMeasurementToGroup = useCallback((id: string, targetGroup: string) => {
+    const plan = planGroupMove(measurements, id, targetGroup);
+    if (plan === null) return; // unknown row or already in the target group
+    const prevRow = measurements.find((m) => m.id === id)!;
+    const destEntry = groupOrderKeys[targetGroup] ?? null;
+    if (isGroupOnly(plan)) {
+      pushUndo({
+        kind: 'move_measurement',
+        measurementId: id,
+        previousGroup: prevRow.group,
+        previousOrderKey: prevRow.orderKey,
+        previousGroupOrder: prevRow.groupOrder ?? null,
+      });
+      setMeasurements((prev) =>
+        moveMeasurementToGroup(prev, id, targetGroup).map((m) =>
+          m.id === id ? withGroupOrderOf(m, destEntry) : m,
+        ),
+      );
+      persistRowGroupOrder([{ id, entry: destEntry }]);
+      return;
+    }
+    pushUndo({
+      kind: 'move_measurement',
+      measurementId: id,
+      previousGroup: prevRow.group,
+      // The post-materialization key at the OLD position: undo restores a
+      // real key (a key can never be REMOVED once persisted — the wire
+      // format drops undefined and the server merges metadata).
+      previousOrderKey: plan.movedPreviousKey,
+      previousGroupOrder: prevRow.groupOrder ?? null,
+    });
+    setMeasurements(plan.rows.map((m) => (m.id === id ? withGroupOrderOf(m, destEntry) : m)));
+    persistOrderKeys([...plan.preserve, ...plan.move]);
+    persistRowGroupOrder([{ id, entry: destEntry }]);
+  }, [measurements, groupOrderKeys, pushUndo, persistOrderKeys, persistRowGroupOrder, withGroupOrderOf]);
+
+  /** Drop a row into an explicit slot: immediately before/after an anchor
+   *  row (same band or another — a cross-band slot drop is a group change +
+   *  slot key in one plan). Header drops keep the append path above. */
+  const handleRowReorder = useCallback((movedId: string, anchorId: string, position: 'before' | 'after') => {
+    if (movedId === anchorId) return;
+    const target = position === 'before' ? { beforeId: anchorId } : { afterId: anchorId };
+    const plan = planRowReorder(measurements, movedId, target);
+    if (plan === null) return;
+    const crossGroup = plan.newGroup !== plan.previousGroup;
+    const destEntry = crossGroup ? (groupOrderKeys[plan.newGroup] ?? null) : null;
+    const prevRow = crossGroup ? measurements.find((m) => m.id === movedId) : undefined;
+    pushUndo({
+      kind: 'move_measurement',
+      measurementId: movedId,
+      previousGroup: plan.previousGroup,
+      // Post-materialization key at the OLD position (same rationale as the
+      // group-move path above: undo restores a real key, never removes one).
+      previousOrderKey: plan.movedPreviousKey,
+      ...(crossGroup ? { previousGroupOrder: prevRow?.groupOrder ?? null } : {}),
+    });
+    setMeasurements(
+      crossGroup
+        ? plan.rows.map((m) => (m.id === movedId ? withGroupOrderOf(m, destEntry) : m))
+        : plan.rows,
+    );
+    persistOrderKeys([...plan.preserve, { id: movedId, orderKey: plan.movedNewKey }]);
+    if (crossGroup) persistRowGroupOrder([{ id: movedId, entry: destEntry }]);
+  }, [measurements, groupOrderKeys, pushUndo, persistOrderKeys, persistRowGroupOrder, withGroupOrderOf]);
+
+  /** Reorder a whole group band: dropping band A on band B inserts A at B's
+   *  position (B shifts down). Two-phase: a first drag materializes every
+   *  band's key at its current position (shared rev), then the moved band
+   *  takes a key between its new neighbours at a fresh rev, applied last. */
+  const handleGroupReorder = useCallback((movedGroup: string, targetGroup: string) => {
+    if (movedGroup === targetGroup) return;
+    const bands = bandOrder(
+      measurements.filter((m) => !isAnnotationType(m.type)),
+      groupOrderKeys,
+    );
+    const targetIndex = bands.filter((g) => g !== movedGroup).indexOf(targetGroup);
+    if (targetIndex < 0 || !bands.includes(movedGroup)) return;
+    const revPhase1 = mintGroupOrderRev();
+    const revPhase2 = mintGroupOrderRev();
+    const plan = planGroupReorder(
+      bands,
+      groupOrderKeys,
+      movedGroup,
+      targetIndex,
+      { phase1: revPhase1, phase2: revPhase2 },
+      groupOrderActor,
+    );
+    if (plan === null) return;
+    // Captured synchronously (post-phase-1, pre-move) so the async queue
+    // never gates op recording.
+    pushUndo({ kind: 'move_group', group: movedGroup, previousEntry: plan.movedPreviousEntry });
+    applyGroupOrder([...plan.phase1, plan.phase2]);
+  }, [measurements, groupOrderKeys, mintGroupOrderRev, groupOrderActor, pushUndo, applyGroupOrder]);
+
   // Latest selected measurement in a ref so the width-seed effect can read it
   // while depending ONLY on the selection id (issue #339). Depending on the
   // object itself would re-seed - and clobber a half-typed real-width value - on
@@ -4128,9 +4344,58 @@ export default function TakeoffViewerModule({
     );
     const name = raw?.trim();
     if (!name || name === activeGroup) return;
+    // Snapshot membership BEFORE the rewrite: the band-order transfer below
+    // targets these rows by id (their group string is about to change).
+    const memberIds = measurements
+      .filter((m) => m.group === activeGroup && !m.suggested)
+      .map((m) => m.id);
     setMeasurements((prev) =>
       prev.map((m) => (m.group === activeGroup ? { ...m, group: name } : m)),
     );
+    // Transfer the band-order entry to the new name (issue #313 family: it
+    // joins colors/hidden/collapsed below). The transferred KEY keeps the
+    // band's position; the fresh rev supersedes any queued writes under the
+    // old triple (queued entries are immutable — supersession is by append).
+    // The old name's entry stays as inert bytes per the no-pruning rule.
+    // Queued writes carry group_name so name + triple land atomically per row.
+    const prevEntry = groupOrderKeys[activeGroup];
+    const destEntry = groupOrderKeys[name];
+    if (prevEntry && !destEntry) {
+      applyGroupOrder([{
+        group: name,
+        entry: { key: prevEntry.key, rev: mintGroupOrderRev(), actor: groupOrderActor },
+        withGroupName: true,
+        memberIds,
+      }]);
+    } else if (prevEntry && destEntry) {
+      // Renaming INTO an existing keyed band is a merge that adopts the
+      // TARGET band's position, so the moved rows must be re-stamped onto
+      // the destination KEY: left alone, their old triples (possibly newer
+      // rev than the target's) would re-teach the convergence fold-back and
+      // drag the merged band to the source band's position. Fresh rev so
+      // the stamp supersedes any queued writes under the source triple.
+      // Only the MOVED rows are written (applyGroupOrder enqueues just the
+      // ids it is given; the existing destination rows keep their older-rev
+      // triples). Deliberate: every triple THIS tab writes carries the same
+      // destination KEY, so fold-back recency picks the same position
+      // whichever rev wins, and writing the destination rows too would let
+      // a stale tab's rename clobber a row another tab concurrently moved
+      // (name and triple ride the same PATCH). It also keeps the merge
+      // atomic per moved row: name and destination triple land together or
+      // not at all, so no row is ever renamed without the merged band's
+      // triple (the queue is sequential, not transactional, so distinct
+      // rows can still land at different times). A stale tab flushing
+      // a pre-merge queued triple over a destination row can still revert
+      // that row server-side — the documented last-write-wins boundary,
+      // which no client-side write set closes (whichever write lands last
+      // wins); recovery needs any surviving row carrying the merged key.
+      applyGroupOrder([{
+        group: name,
+        entry: { key: destEntry.key, rev: mintGroupOrderRev(), actor: groupOrderActor },
+        withGroupName: true,
+        memberIds,
+      }]);
+    }
     setCustomGroupColors((prev) => {
       const moved = prev[activeGroup];
       if (moved == null) return prev;
@@ -4159,7 +4424,7 @@ export default function TakeoffViewerModule({
       return next;
     });
     setActiveGroup(name);
-  }, [activeGroup, t]);
+  }, [activeGroup, t, measurements, groupOrderKeys, applyGroupOrder, mintGroupOrderRev, groupOrderActor]);
 
   /** Toggle visibility of a measurement group */
   const toggleGroupVisibility = useCallback((groupName: string) => {
@@ -4211,9 +4476,10 @@ export default function TakeoffViewerModule({
   const handleExportCSV = useCallback(() => {
     if (measurements.length === 0) return;
     const rows: string[] = ['Group,Type,Annotation,Value,Unit,Page'];
-    // Group measurements by group name for subtotals
+    // Group measurements by group name for subtotals, blocks in the persisted
+    // band order so the file reads like the sidebar.
     const byGroup: Record<string, Measurement[]> = {};
-    for (const m of measurements) {
+    for (const m of presentationOrder(measurements, groupOrderKeys)) {
       const g = m.group || 'General';
       if (!byGroup[g]) byGroup[g] = [];
       byGroup[g]!.push(m);
@@ -4283,7 +4549,7 @@ export default function TakeoffViewerModule({
     link.click();
     URL.revokeObjectURL(url);
     addToast({ type: 'success', title: t('takeoff.csv_exported', { defaultValue: 'Measurements exported to CSV' }) });
-  }, [measurements, addToast, t, measurementSystem]);
+  }, [measurements, addToast, t, measurementSystem, groupOrderKeys]);
 
   /**
    * Resolve the human-friendly project name for export filenames.
@@ -4331,6 +4597,7 @@ export default function TakeoffViewerModule({
         groupColorMap,
         projectName: exportProjectName,
         measurementSystem,
+        groupOrderKeys,
       });
       const blob = pdf.output('blob');
       triggerDownload(blob, buildExportFilename(exportProjectName, 'pdf'));
@@ -4352,7 +4619,7 @@ export default function TakeoffViewerModule({
     } finally {
       setIsExportingPdf(false);
     }
-  }, [pdfDoc, measurements, hiddenGroups, hiddenMeasurements, scale, exportProjectName, addToast, t, measurementSystem, groupColorMap]);
+  }, [pdfDoc, measurements, hiddenGroups, hiddenMeasurements, scale, exportProjectName, addToast, t, measurementSystem, groupColorMap, groupOrderKeys]);
 
   /** Export measurements + summary to an .xlsx workbook. */
   const handleExportExcel = useCallback(async () => {
@@ -4379,6 +4646,7 @@ export default function TakeoffViewerModule({
         groupColorMap,
         projectName: exportProjectName,
         measurementSystem,
+        groupOrderKeys,
       });
       const buf = await wb.xlsx.writeBuffer();
       const blob = new Blob([buf], {
@@ -4403,7 +4671,7 @@ export default function TakeoffViewerModule({
     } finally {
       setIsExportingXlsx(false);
     }
-  }, [measurements, scale, exportProjectName, addToast, t, measurementSystem, groupColorMap]);
+  }, [measurements, scale, exportProjectName, addToast, t, measurementSystem, groupColorMap, groupOrderKeys]);
 
   const deleteMeasurement = useCallback((id: string) => {
     // Capture the target up front so we can both push an undo frame and queue
@@ -4445,6 +4713,11 @@ export default function TakeoffViewerModule({
       points: src.points.map((p) => ({ x: p.x + offset, y: p.y + offset })),
       serverId: undefined,
       suggested: undefined,
+      // Fresh identity, fresh order: the copy is a NEW row (newest-on-top),
+      // and inheriting the source's persisted order key would mint a
+      // duplicate key.
+      createdAt: newMeasurementStamp(),
+      orderKey: undefined,
       linkedPositionId: undefined,
       linkedPositionOrdinal: undefined,
       linkedBoqId: undefined,
@@ -4475,7 +4748,13 @@ export default function TakeoffViewerModule({
         pages,
         (_src, page, i) =>
           `m_${stamp}_p${page}_${i}_${Math.random().toString(36).slice(2, 6)}`,
-      );
+      ).map((c) => ({
+        // Fresh identity, fresh order (same rule as duplicateMeasurement):
+        // a page-copy must not inherit the source's persisted order key.
+        ...c,
+        createdAt: newMeasurementStamp(),
+        orderKey: undefined,
+      }));
       if (clones.length === 0) return;
       for (const c of clones) {
         pushUndo({ kind: 'complete_measurement', measurement: c, previousActivePoints: [] });
@@ -4570,6 +4849,7 @@ export default function TakeoffViewerModule({
               : t('takeoff_viewer.recognize_uncalibrated', { defaultValue: 'calibrate for value' });
         return {
           id: `sug_${Date.now()}_${i}`,
+          createdAt: newMeasurementStamp(),
           type: mType,
           points: c.points.map((p) => ({ x: p.x, y: p.y })),
           value,
@@ -4652,6 +4932,7 @@ export default function TakeoffViewerModule({
         const avgConfidence = hits.reduce((s, h) => s + (h.confidence ?? 0), 0) / hits.length;
         const suggestion: Measurement = {
           id: `sug_${Date.now()}_cnt`,
+          createdAt: newMeasurementStamp(),
           type: 'count',
           points,
           value: points.length,
@@ -4959,7 +5240,12 @@ export default function TakeoffViewerModule({
     setIsExporting(true);
     try {
       let ordinalCounter = 1;
-      const exportableMeasurements = measurements.filter((m) => !isAnnotationType(m.type));
+      // TK.NNN ordinals follow the band-major presentation order so the BOQ
+      // reads top-to-bottom like the sidebar, not the flat storage order.
+      const exportableMeasurements = presentationOrder(
+        measurements.filter((m) => !isAnnotationType(m.type)),
+        groupOrderKeys,
+      );
       for (const m of exportableMeasurements) {
         const unitMap: Record<string, string> = { m: 'm', 'm\u00B2': 'm2', 'm\u00B3': 'm3', pcs: 'pcs' };
         const posData: CreatePositionData = {
@@ -4983,7 +5269,7 @@ export default function TakeoffViewerModule({
     } finally {
       setIsExporting(false);
     }
-  }, [selectedBoqId, measurements, addToast, t]);
+  }, [selectedBoqId, measurements, addToast, t, groupOrderKeys]);
 
   const clearAll = useCallback(() => {
     // Queue a server-side delete for every synced row before wiping state
@@ -5664,8 +5950,11 @@ export default function TakeoffViewerModule({
         break;
 
       case 'delete_measurement':
-        // Restore the deleted measurement
-        setMeasurements((prev) => [...prev, op.measurement]);
+        // Restore the deleted measurement at its canonical position (a keyed
+        // row returns to its slot, a keyless one to its creation slot) —
+        // appending put an old restored row on top for the session and back
+        // at its creation position after reload.
+        setMeasurements((prev) => insertCanonical(prev, op.measurement));
         break;
 
       case 'change_annotation': {
@@ -5687,6 +5976,56 @@ export default function TakeoffViewerModule({
         break;
       }
 
+      case 'move_measurement': {
+        // Capture the current (post-move) group/key so redo can replay the
+        // move, then restore the old group + old-position key and let the
+        // comparator re-place the row. Capture reads measurementsRef (like
+        // move_group's ref read below), NOT the updater's `prev`: React only
+        // evaluates updaters eagerly on an empty queue, so an assignment
+        // inside one may not have run by the time forwardOp is pushed. The
+        // restored key goes through the sequential order flush (not the
+        // debounced PATCH): only queued keys carry pending provenance, so a
+        // reload before an un-queued key write landed would rehydrate the
+        // SERVER key and silently revert the undo.
+        const target = measurementsRef.current.find((m) => m.id === op.measurementId);
+        if (target) {
+          forwardOp = {
+            kind: 'move_measurement',
+            measurementId: op.measurementId,
+            previousGroup: target.group,
+            previousOrderKey: target.orderKey,
+            ...(op.previousGroupOrder !== undefined
+              ? { previousGroupOrder: target.groupOrder ?? null }
+              : {}),
+          };
+        }
+        setMeasurements((prev) =>
+          sortCanonical(
+            prev.map((m) => {
+              if (m.id !== op.measurementId) return m;
+              const moved = { ...m, group: op.previousGroup, orderKey: op.previousOrderKey };
+              // Cross-band move: restore the row's pre-move mirrored triple
+              // (or its absence) so the return trip cannot re-teach the map
+              // the wrong band key either.
+              return op.previousGroupOrder !== undefined
+                ? withGroupOrderOf(moved, op.previousGroupOrder)
+                : moved;
+            }),
+          ),
+        );
+        if (op.previousOrderKey !== undefined) {
+          persistOrderKeys([
+            { id: op.measurementId, orderKey: op.previousOrderKey },
+          ]);
+        }
+        if (op.previousGroupOrder !== undefined) {
+          persistRowGroupOrder([
+            { id: op.measurementId, entry: op.previousGroupOrder },
+          ]);
+        }
+        break;
+      }
+
       case 'edit_geometry':
         // Restore the pre-edit measurement (geometry + derived value/label).
         // The persistence effect re-PATCHes the restored points so the
@@ -5699,6 +6038,21 @@ export default function TakeoffViewerModule({
           ),
         );
         break;
+
+      case 'move_group': {
+        // Capture the band's current entry so redo replays the move, then
+        // restore the pre-move KEY at a fresh rev (never the old rev — a
+        // stale rev would lose fold-back recency to the move being undone).
+        const current = groupOrderKeysRef.current[op.group];
+        if (current) {
+          forwardOp = { kind: 'move_group', group: op.group, previousEntry: current };
+        }
+        applyGroupOrder([{
+          group: op.group,
+          entry: { key: op.previousEntry.key, rev: mintGroupOrderRev(), actor: groupOrderActor },
+        }]);
+        break;
+      }
     }
 
     // Push the (possibly-adjusted) forward op onto redo.
@@ -5706,7 +6060,7 @@ export default function TakeoffViewerModule({
     setRedoCount(redoStackRef.current.length);
 
     addToast({ type: 'info', title: t('takeoff.undo', { defaultValue: 'Undo' }), message: t('takeoff.measurement_undone', { defaultValue: 'Measurement undone' }) });
-  }, [addToast, t, registerDeletion]);
+  }, [addToast, t, registerDeletion, persistOrderKeys, persistRowGroupOrder, withGroupOrderOf, applyGroupOrder, mintGroupOrderRev, groupOrderActor]);
 
   /** Re-apply the most recently undone operation. */
   const handleRedo = useCallback(() => {
@@ -5790,6 +6144,49 @@ export default function TakeoffViewerModule({
         break;
       }
 
+      case 'move_measurement': {
+        // Symmetric with undo: write the op's group/key (the captured
+        // post-move values), capturing the current ones for the next undo
+        // (ref read, not updater capture — same reasoning as the undo case).
+        // The re-applied key rides the sequential order flush for the same
+        // reload-provenance reason as the undo case.
+        const target = measurementsRef.current.find((m) => m.id === op.measurementId);
+        if (target) {
+          reverseOp = {
+            kind: 'move_measurement',
+            measurementId: op.measurementId,
+            previousGroup: target.group,
+            previousOrderKey: target.orderKey,
+            ...(op.previousGroupOrder !== undefined
+              ? { previousGroupOrder: target.groupOrder ?? null }
+              : {}),
+          };
+        }
+        setMeasurements((prev) =>
+          sortCanonical(
+            prev.map((m) => {
+              if (m.id !== op.measurementId) return m;
+              const moved = { ...m, group: op.previousGroup, orderKey: op.previousOrderKey };
+              // Same cross-band triple restore as undo (symmetric replay).
+              return op.previousGroupOrder !== undefined
+                ? withGroupOrderOf(moved, op.previousGroupOrder)
+                : moved;
+            }),
+          ),
+        );
+        if (op.previousOrderKey !== undefined) {
+          persistOrderKeys([
+            { id: op.measurementId, orderKey: op.previousOrderKey },
+          ]);
+        }
+        if (op.previousGroupOrder !== undefined) {
+          persistRowGroupOrder([
+            { id: op.measurementId, entry: op.previousGroupOrder },
+          ]);
+        }
+        break;
+      }
+
       case 'edit_geometry':
         // Re-apply the post-edit measurement.
         setMeasurements((prev) =>
@@ -5800,6 +6197,20 @@ export default function TakeoffViewerModule({
           ),
         );
         break;
+
+      case 'move_group': {
+        // Symmetric with undo: re-apply the captured entry's KEY at a fresh
+        // rev, capturing the current entry for the next undo.
+        const current = groupOrderKeysRef.current[op.group];
+        if (current) {
+          reverseOp = { kind: 'move_group', group: op.group, previousEntry: current };
+        }
+        applyGroupOrder([{
+          group: op.group,
+          entry: { key: op.previousEntry.key, rev: mintGroupOrderRev(), actor: groupOrderActor },
+        }]);
+        break;
+      }
     }
 
     // Push the reverse op onto undo so Ctrl+Z works again.
@@ -5811,7 +6222,7 @@ export default function TakeoffViewerModule({
       title: t('takeoff.redo', { defaultValue: 'Redo' }),
       message: t('takeoff.measurement_redone', { defaultValue: 'Measurement redone' }),
     });
-  }, [addToast, t, countLabel, currentPage, activeGroup, registerDeletion]);
+  }, [addToast, t, countLabel, currentPage, activeGroup, registerDeletion, persistOrderKeys, persistRowGroupOrder, withGroupOrderOf, applyGroupOrder, mintGroupOrderRev, groupOrderActor]);
 
   /** Unified tool-switch logic (shared between toolbar buttons + shortcuts). */
   const selectTool = useCallback((tool: MeasureTool) => {
@@ -7733,7 +8144,10 @@ export default function TakeoffViewerModule({
                   </div>
                 )}
                 <MeasurementLedger
-                  measurements={measurements}
+                  // Band-major presentation order: the ledger's default
+                  // ('ordinal') sort preserves input order, so the default
+                  // view reads top-to-bottom like the sidebar.
+                  measurements={presentationOrder(measurements, groupOrderKeys)}
                   groupColorMap={groupColorMap}
                   onRowClick={handleLedgerRowClick}
                   selectedMeasurementId={selectedMeasurementId}
@@ -7812,11 +8226,14 @@ export default function TakeoffViewerModule({
                       if (val === '__new__') {
                         const name = prompt(t('takeoff_viewer.new_group_prompt', { defaultValue: 'New group name' }));
                         if (name && name.trim()) {
-                          updateSelectedMeasurement({ group: name.trim() });
+                          handleMoveMeasurementToGroup(selectedMeasurement.id, name.trim());
                         }
                         return;
                       }
-                      updateSelectedMeasurement({ group: val });
+                      // Through the order-aware move (NOT a bare field patch):
+                      // the dropdown must re-slot the row exactly like the
+                      // drag path, or the two paths diverge on z-order.
+                      handleMoveMeasurementToGroup(selectedMeasurement.id, val);
                     }}
                     className="w-full rounded border border-border bg-surface-primary px-2 py-1 text-xs text-content-primary"
                     data-testid="prop-group-select"
@@ -8591,6 +9008,8 @@ export default function TakeoffViewerModule({
 
               <div className="space-y-2 max-h-[400px] overflow-auto">
                 {/* Measurement groups (non-annotation types) */}
+                {/* Drag targets are limited to non-empty groups on this page; use
+                    Properties to move into a new or empty group. */}
                 {Object.entries(groupedPageMeasurements).map(([groupName, groupMs]) => {
                   const measurementOnly = groupMs.filter((m) => !isAnnotationType(m.type));
                   if (measurementOnly.length === 0) return null;
@@ -8598,9 +9017,70 @@ export default function TakeoffViewerModule({
                   const isHidden = hiddenGroups.has(groupName);
                   const isCollapsed = collapsedGroups.has(groupName);
                   return (
-                    <div key={groupName}>
+                    <div
+                      key={groupName}
+                      className={clsx(
+                        dropTargetGroup === groupName && draggingMeasurementId
+                          && 'ring-1 ring-oe-blue/50 rounded-md bg-oe-blue/5',
+                        // Band drop indicator: the dragged band lands AT this
+                        // band's position (this one shifts down).
+                        groupDropTarget === groupName && draggingGroupName
+                          && 'border-t-2 border-oe-blue rounded-sm',
+                      )}
+                      onDragOver={(e) => {
+                        if (draggingGroupName && draggingGroupName !== groupName) {
+                          e.preventDefault();
+                          e.dataTransfer.dropEffect = 'move';
+                          if (groupDropTarget !== groupName) setGroupDropTarget(groupName);
+                          return;
+                        }
+                        if (draggingMeasurementId) {
+                          e.preventDefault();
+                          e.dataTransfer.dropEffect = 'move';
+                          if (dropTargetGroup !== groupName) setDropTargetGroup(groupName);
+                        }
+                      }}
+                      onDrop={(e) => {
+                        e.preventDefault();
+                        if (draggingGroupName && draggingGroupName !== groupName) {
+                          handleGroupReorder(draggingGroupName, groupName);
+                        } else if (draggingMeasurementId) {
+                          handleMoveMeasurementToGroup(draggingMeasurementId, groupName);
+                        }
+                        setDraggingMeasurementId(null);
+                        setDropTargetGroup(null);
+                        setDraggingGroupName(null);
+                        setGroupDropTarget(null);
+                        setRowDropTarget(null);
+                      }}
+                      data-testid="measurement-group-dropzone"
+                      data-group={groupName}
+                    >
                       {/* Group header */}
                       <div className="flex items-center gap-1.5 mb-1">
+                        {/* Mouse-only band drag affordance, mirroring the row
+                            handle: aria-hidden, not a focus stop. */}
+                        <span
+                          draggable
+                          onClick={(e) => e.stopPropagation()}
+                          onDragStart={(e) => {
+                            e.stopPropagation();
+                            setDraggingGroupName(groupName);
+                            e.dataTransfer.effectAllowed = 'move';
+                            e.dataTransfer.setData('text/plain', groupName);
+                          }}
+                          onDragEnd={() => {
+                            setDraggingGroupName(null);
+                            setGroupDropTarget(null);
+                          }}
+                          className="cursor-grab active:cursor-grabbing text-content-tertiary opacity-40 hover:opacity-100 transition-opacity shrink-0"
+                          aria-hidden="true"
+                          title={t('takeoff_viewer.drag_group_to_reorder', { defaultValue: 'Drag to reorder groups' })}
+                          data-testid="group-drag-handle"
+                          data-group={groupName}
+                        >
+                          <GripVertical size={11} />
+                        </span>
                         <button
                           onClick={() => toggleGroupCollapse(groupName)}
                           className="p-0.5 rounded hover:bg-surface-secondary text-content-tertiary transition-colors"
@@ -8640,6 +9120,38 @@ export default function TakeoffViewerModule({
                             <div
                               key={m.id}
                               onClick={() => setSelectedMeasurementId((cur) => (cur === m.id ? null : m.id))}
+                              onDragOver={(e) => {
+                                // Row slot drop: place the dragged row before/
+                                // after this one by cursor half. Swallow the
+                                // event so the band container doesn't also arm
+                                // its append highlight.
+                                if (draggingMeasurementId && draggingMeasurementId !== m.id) {
+                                  e.preventDefault();
+                                  e.stopPropagation();
+                                  e.dataTransfer.dropEffect = 'move';
+                                  const rect = e.currentTarget.getBoundingClientRect();
+                                  const position = e.clientY < rect.top + rect.height / 2 ? 'before' : 'after';
+                                  setRowDropTarget((cur) =>
+                                    cur?.id === m.id && cur.position === position ? cur : { id: m.id, position },
+                                  );
+                                  if (dropTargetGroup) setDropTargetGroup(null);
+                                }
+                              }}
+                              onDragLeave={() => {
+                                setRowDropTarget((cur) => (cur?.id === m.id ? null : cur));
+                              }}
+                              onDrop={(e) => {
+                                if (draggingMeasurementId && draggingMeasurementId !== m.id) {
+                                  e.preventDefault();
+                                  e.stopPropagation();
+                                  const rect = e.currentTarget.getBoundingClientRect();
+                                  const position = e.clientY < rect.top + rect.height / 2 ? 'before' : 'after';
+                                  handleRowReorder(draggingMeasurementId, m.id, position);
+                                  setDraggingMeasurementId(null);
+                                  setDropTargetGroup(null);
+                                  setRowDropTarget(null);
+                                }
+                              }}
                               className={clsx(
                                 'rounded-sm px-2 py-1 group/item transition-all cursor-pointer',
                                 selectedMeasurementId === m.id
@@ -8648,12 +9160,40 @@ export default function TakeoffViewerModule({
                                 // Dim a hidden measurement, keeping it listed so it
                                 // can be restored, the way hidden groups behave (#359).
                                 hiddenMeasurements.has(m.id) && 'opacity-50',
+                                // Slot indicator: an edge line on the drop side.
+                                rowDropTarget?.id === m.id && draggingMeasurementId
+                                  && (rowDropTarget.position === 'before'
+                                    ? 'border-t-2 border-t-oe-blue'
+                                    : 'border-b-2 border-b-oe-blue'),
                               )}
                               data-testid="measurement-item"
                               data-selected={selectedMeasurementId === m.id}
                               data-hidden={hiddenMeasurements.has(m.id)}
                             >
                               <div className="flex items-center gap-2 leading-tight">
+                                {/* Mouse-only drag affordance. Keyboard/screen-reader
+                                    users regroup via the Properties Group dropdown, so
+                                    the handle is aria-hidden and not a focus stop. */}
+                                <span
+                                  draggable
+                                  onClick={(e) => e.stopPropagation()}
+                                  onDragStart={(e) => {
+                                    e.stopPropagation();
+                                    setDraggingMeasurementId(m.id);
+                                    e.dataTransfer.effectAllowed = 'move';
+                                    e.dataTransfer.setData('text/plain', m.id);
+                                  }}
+                                  onDragEnd={() => {
+                                    setDraggingMeasurementId(null);
+                                    setDropTargetGroup(null);
+                                  }}
+                                  className="cursor-grab active:cursor-grabbing text-content-tertiary opacity-40 group-hover/item:opacity-100 transition-opacity shrink-0"
+                                  aria-hidden="true"
+                                  title={t('takeoff_viewer.drag_to_regroup', { defaultValue: 'Drag to move to another group' })}
+                                  data-testid="measurement-drag-handle"
+                                >
+                                  <GripVertical size={11} />
+                                </span>
                                 <span
                                   className="h-2 w-2 rounded-full shrink-0"
                                   style={{ backgroundColor: groupColor }}

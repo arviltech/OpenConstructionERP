@@ -90,6 +90,23 @@ export interface Measurement {
   suggested?: boolean;
   /** Recognition confidence 0..1 on AI-sourced measurements. */
   confidence?: number;
+  /** ISO creation stamp carried in memory for the canonical ordering
+   *  tie-break (server rows map it from `created_at`; in-session creates
+   *  stamp it at build time). Display-only ordering data — never sent to
+   *  the server, which keeps its own authoritative `created_at`. */
+  createdAt?: string;
+  /** Persisted z/list-order key (`metadata.order_key`): a fractional index
+   *  compared by plain codepoint order. Absent on rows that were never
+   *  explicitly placed — keyless rows sort after every keyed row, in
+   *  creation order (the append semantic). See lib/order-key.ts. */
+  orderKey?: string;
+  /** This row's GROUP's persisted band-order triple
+   *  (`metadata.group_order_key/_rev/_actor`), mirrored onto every member
+   *  row because groups have no server entity. Must be re-stamped to the
+   *  destination band's entry (or cleared) whenever the row changes group —
+   *  a stale triple riding along re-teaches the map the old band's key for
+   *  the new group. See lib/group-order.ts. */
+  groupOrder?: import('./group-order').GroupOrderEntry;
 }
 
 /** Describes a reversible measurement operation for the undo stack. */
@@ -112,4 +129,15 @@ export type UndoOperation =
       kind: 'change_annotation';
       measurementId: string;
       previousAnnotation: string;
+    }
+  | {
+      kind: 'move_measurement';
+      measurementId: string;
+      previousGroup: string;
+      /** The row's post-materialization key at its OLD position (a group
+       *  move materializes keys first, so this is never undefined for a
+       *  placed move; group-only moves record the key the row already had,
+       *  if any). Undo restores it and lets the comparator re-place the row;
+       *  no numeric index is stored (indexes go stale under edits). */
+      previousOrderKey?: string;
     };

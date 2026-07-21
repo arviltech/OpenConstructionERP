@@ -32,6 +32,20 @@ export interface GroupSummary {
   unit: string;
 }
 
+/** Move a measurement to another group without disturbing list order. */
+export function moveMeasurementToGroup(
+  measurements: Measurement[],
+  id: string,
+  targetGroup: string,
+): Measurement[] {
+  const measurement = measurements.find((m) => m.id === id);
+  if (!measurement || measurement.group === targetGroup) return measurements;
+
+  return measurements.map((m) =>
+    m.id === id ? { ...m, group: targetGroup } : m,
+  );
+}
+
 /**
  * Summarize measurements for the legend.  Produces one row per group
  * present on the supplied measurement list, with the group color looked
@@ -41,6 +55,7 @@ export function computeGroupSummaries(
   measurements: Measurement[],
   groupColorMap: Readonly<Record<string, string>>,
   fallbackColor: string = '#3B82F6',
+  bandOrder?: readonly string[],
 ): GroupSummary[] {
   const byGroup = new Map<
     string,
@@ -83,8 +98,22 @@ export function computeGroupSummaries(
     });
   }
 
-  // Stable, predictable ordering for the legend: by name.
-  summaries.sort((a, b) => a.name.localeCompare(b.name));
+  // Stable, predictable ordering for the legend: the caller's band order
+  // when provided (so the legend reads top-to-bottom like the sidebar),
+  // else by name.
+  if (bandOrder) {
+    const idx = new Map(bandOrder.map((g, i) => [g, i] as const));
+    summaries.sort((a, b) => {
+      const ia = idx.get(a.name);
+      const ib = idx.get(b.name);
+      if (ia !== undefined && ib !== undefined) return ia - ib;
+      if (ia !== undefined) return -1;
+      if (ib !== undefined) return 1;
+      return a.name.localeCompare(b.name);
+    });
+  } else {
+    summaries.sort((a, b) => a.name.localeCompare(b.name));
+  }
   return summaries;
 }
 

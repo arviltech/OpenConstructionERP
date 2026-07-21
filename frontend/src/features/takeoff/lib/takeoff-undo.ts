@@ -10,6 +10,7 @@
  */
 
 import type { Measurement, Point, UndoOperation } from './takeoff-types';
+import { insertCanonical, sortCanonical } from './order-key';
 
 export interface TakeoffState {
   measurements: Measurement[];
@@ -58,9 +59,13 @@ export function reverseOperation(
       };
 
     case 'delete_measurement':
+      // Restore at the row's canonical position (a keyed row returns to its
+      // slot, a keyless one to its creation slot) instead of appending it to
+      // the end, which put an old restored row on top for the session but
+      // back at its creation position after reload.
       return {
         ...state,
-        measurements: [...state.measurements, op.measurement],
+        measurements: insertCanonical(state.measurements, op.measurement),
       };
 
     case 'change_annotation':
@@ -70,6 +75,22 @@ export function reverseOperation(
           m.id === op.measurementId
             ? { ...m, annotation: op.previousAnnotation }
             : m,
+        ),
+      };
+
+    case 'move_measurement':
+      // Reverse a group move: restore the old group + old-position order key
+      // and let the comparator re-place the row. The React layer captures the
+      // forward (post-move) group/key at reversal time for redo, mirroring
+      // change_annotation.
+      return {
+        ...state,
+        measurements: sortCanonical(
+          state.measurements.map((m) =>
+            m.id === op.measurementId
+              ? { ...m, group: op.previousGroup, orderKey: op.previousOrderKey }
+              : m,
+          ),
         ),
       };
   }
@@ -158,5 +179,21 @@ export function applyOperation(
       // and clearing redo — so this branch should rarely fire in
       // practice.  We leave the state unchanged as a safe default.
       return state;
+
+    case 'move_measurement':
+      // Symmetric with reverseOperation: the op's fields hold the target
+      // group/key to write (the React layer captures the forward values into
+      // a same-shaped op at reversal time, as with change_annotation), and
+      // the comparator re-places the row.
+      return {
+        ...state,
+        measurements: sortCanonical(
+          state.measurements.map((m) =>
+            m.id === op.measurementId
+              ? { ...m, group: op.previousGroup, orderKey: op.previousOrderKey }
+              : m,
+          ),
+        ),
+      };
   }
 }

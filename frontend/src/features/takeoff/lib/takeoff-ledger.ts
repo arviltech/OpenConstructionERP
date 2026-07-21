@@ -90,8 +90,15 @@ export function sortMeasurements(
 ): Measurement[] {
   const mult = direction === 'asc' ? 1 : -1;
   const out = [...measurements];
+  // 'ordinal' (the default) preserves the caller's input order — the viewer
+  // passes the band-major presentation projection, so the default ledger
+  // reads top-to-bottom like the sidebar; every other column re-sorts.
+  const inputIdx = new Map(measurements.map((m, i) => [m.id, i] as const));
   out.sort((a, b) => {
-    const primary = compareByColumn(a, b, column);
+    const primary =
+      column === 'ordinal'
+        ? inputIdx.get(a.id)! - inputIdx.get(b.id)!
+        : compareByColumn(a, b, column);
     if (primary !== 0) return primary * mult;
     // Tie-breaker: page asc, annotation asc, id asc — gives stable order.
     if (a.page !== b.page) return a.page - b.page;

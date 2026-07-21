@@ -1,3 +1,4 @@
+import { useState } from 'react';
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import { renderHook, act, waitFor } from '@testing-library/react';
 import {
@@ -41,6 +42,9 @@ type TestMeasurement = {
   color?: string;
   text?: string;
   strokeWidthReal?: number;
+  orderKey?: string;
+  createdAt?: string;
+  groupOrder?: { key: string; rev: number; actor: string };
 };
 const makeMeasurement = (id: string, page = 1): TestMeasurement => ({
   id,
@@ -53,6 +57,22 @@ const makeMeasurement = (id: string, page = 1): TestMeasurement => ({
   page,
   group: 'General',
 });
+
+// The hook dispatches both plain arrays and functional updaters (the stamp
+// path is functional so it cannot clobber a same-tick rename). Replay the
+// recorded dispatches in order, exactly as React's queue would, to recover
+// the resulting state from a vi.fn() setter.
+const replayDispatches = (
+  setM: ReturnType<typeof vi.fn>,
+  initial: TestMeasurement[] = [],
+): TestMeasurement[] =>
+  setM.mock.calls.reduce(
+    (state: TestMeasurement[], c: unknown[]) =>
+      typeof c[0] === 'function'
+        ? (c[0] as (p: TestMeasurement[]) => TestMeasurement[])(state)
+        : (c[0] as TestMeasurement[]),
+    initial,
+  );
 
 const defaultScale = { pixelsPerUnit: 100, unitLabel: 'm' };
 const basePageScales: PageScales = emptyPageScales();
@@ -1010,5 +1030,834 @@ describe('useMeasurementPersistence', () => {
     expect(body.metadata.stroke_width_real).toBe(0.2);
 
     vi.useRealTimers();
+  });
+
+  /* ── Persisted measurement order (metadata.order_key) ── */
+
+  // Server row factory for the order tests: a full API row with an optional
+  // metadata.order_key and created_at.
+  const apiOrderRow = (
+    serverId: string,
+    frontendId: string,
+    createdAt: string,
+    orderKey?: string,
+  ) => ({
+    id: serverId, project_id: PROJECT, document_id: DOC, page: 1,
+    type: 'distance', points: [{ x: 0, y: 0 }, { x: 10, y: 0 }],
+    group_name: 'General', group_color: '#3B82F6', annotation: `D-${frontendId}`,
+    measurement_value: 1, measurement_unit: 'm', depth: null,
+    volume: null, perimeter: null, count_value: null,
+    scale_pixels_per_unit: 100, linked_boq_position_id: null,
+    is_deduction: false,
+    metadata: {
+      frontend_id: frontendId,
+      scale_calibrated: false,
+      ...(orderKey ? { order_key: orderKey } : {}),
+    },
+    created_at: createdAt,
+  });
+
+  it('hydrates explicitly keyed rows in key order, ahead of keyless creation order', async () => {
+    const { takeoffApi } = await import('@/features/takeoff/api');
+    // m1 is the OLDEST row but keyed LAST ('a2'); m2 is newer but keyed
+    // first ('a1'); m3 is keyless. Creation-order hydrate would give
+    // m1,m2,m3 — the keys must override to m2,m1,m3.
+    (takeoffApi.list as unknown as ReturnType<typeof vi.fn>).mockResolvedValueOnce([
+      apiOrderRow('srv-3', 'm3', '2026-07-19T10:02:00Z'),
+      apiOrderRow('srv-2', 'm2', '2026-07-19T10:01:00Z', 'a1'),
+      apiOrderRow('srv-1', 'm1', '2026-07-19T10:00:00Z', 'a2'),
+    ]);
+    const setM = vi.fn();
+    renderHook(() =>
+      useMeasurementPersistence({
+        fileName: 'ord.pdf', documentId: DOC, measurements: [],
+        setMeasurements: setM, pageScales: basePageScales, setPageScales: vi.fn(),
+        scale: defaultScale, projectId: PROJECT,
+      }),
+    );
+    await waitFor(() => expect(setM).toHaveBeenCalled());
+    const loaded = setM.mock.calls[setM.mock.calls.length - 1]![0] as Array<{
+      id: string; orderKey?: string;
+    }>;
+    expect(loaded.map((m) => m.id)).toEqual(['m2', 'm1', 'm3']);
+    expect(loaded.map((m) => m.orderKey)).toEqual(['a1', 'a2', undefined]);
+  });
+
+  it('reconcile: the server key wins over a stale local key when no write is pending', async () => {
+    const { takeoffApi } = await import('@/features/takeoff/api');
+    // The local copy of m1 carries an OLD key 'a9' (e.g. this tab slept
+    // through a move made elsewhere). Its id is NOT in pendingOrderKeys, so
+    // the server's newer 'a1' must win — prefer-local would roll the move
+    // back for every client.
+    localStorage.setItem(compositeKey, JSON.stringify({
+      measurements: [{
+        ...makeMeasurement('m1'), serverId: 'srv-1', orderKey: 'a9',
+      }],
+      scale: defaultScale,
+      savedAt: 1,
+    }));
+    (takeoffApi.list as unknown as ReturnType<typeof vi.fn>).mockResolvedValueOnce([
+      apiOrderRow('srv-1', 'm1', '2026-07-19T10:00:00Z', 'a1'),
+      apiOrderRow('srv-2', 'm2', '2026-07-19T10:01:00Z', 'a2'),
+    ]);
+    const setM = vi.fn();
+    renderHook(() =>
+      useMeasurementPersistence({
+        fileName: 'ord.pdf', documentId: DOC, measurements: [],
+        setMeasurements: setM, pageScales: basePageScales, setPageScales: vi.fn(),
+        scale: defaultScale, projectId: PROJECT,
+      }),
+    );
+    await waitFor(() => expect(setM).toHaveBeenCalled());
+    const loaded = setM.mock.calls[setM.mock.calls.length - 1]![0] as Array<{
+      id: string; orderKey?: string;
+    }>;
+    expect(loaded.map((m) => m.id)).toEqual(['m1', 'm2']);
+    expect(loaded[0]!.orderKey).toBe('a1');
+  });
+
+  it('reconcile: a pending local key wins and the interrupted flush resumes on reload', async () => {
+    const { takeoffApi } = await import('@/features/takeoff/api');
+    // A move to 'a9' was applied locally but its PATCH never landed (reload
+    // mid-flush): the queue + provenance set persisted with the rows. On
+    // load the local key must win over the server's stale 'a1' AND the
+    // queued write must be re-sent.
+    localStorage.setItem(compositeKey, JSON.stringify({
+      measurements: [{
+        ...makeMeasurement('m1'), serverId: 'srv-1', orderKey: 'a9',
+      }],
+      scale: defaultScale,
+      savedAt: 1,
+      orderQueue: [{ id: 'm1', orderKey: 'a9' }],
+      pendingOrderKeys: ['m1'],
+    }));
+    (takeoffApi.list as unknown as ReturnType<typeof vi.fn>).mockResolvedValueOnce([
+      apiOrderRow('srv-1', 'm1', '2026-07-19T10:00:00Z', 'a1'),
+      apiOrderRow('srv-2', 'm2', '2026-07-19T10:01:00Z', 'a2'),
+    ]);
+    const setM = vi.fn();
+    renderHook(() =>
+      useMeasurementPersistence({
+        fileName: 'ord.pdf', documentId: DOC, measurements: [],
+        setMeasurements: setM, pageScales: basePageScales, setPageScales: vi.fn(),
+        scale: defaultScale, projectId: PROJECT,
+      }),
+    );
+    await waitFor(() => expect(setM).toHaveBeenCalled());
+    const loaded = replayDispatches(setM);
+    // Local pending key wins: m1 ('a9') sorts after m2 ('a2').
+    expect(loaded.map((m) => m.id)).toEqual(['m2', 'm1']);
+    expect(loaded.find((m) => m.id === 'm1')!.orderKey).toBe('a9');
+    // The queued write resumes against the server.
+    await waitFor(() =>
+      expect(takeoffApi.update).toHaveBeenCalledWith('srv-1', {
+        metadata: { order_key: 'a9' },
+      }),
+    );
+  });
+
+  it('persistOrderKeys drains strictly sequentially with metadata-only bodies', async () => {
+    const { takeoffApi } = await import('@/features/takeoff/api');
+    let inFlight = 0;
+    let maxInFlight = 0;
+    (takeoffApi.update as unknown as ReturnType<typeof vi.fn>).mockImplementation(
+      async () => {
+        inFlight += 1;
+        maxInFlight = Math.max(maxInFlight, inFlight);
+        await new Promise((r) => setTimeout(r, 0));
+        inFlight -= 1;
+        return {};
+      },
+    );
+    const rows = [
+      { ...makeMeasurement('m1'), serverId: 'srv-1' },
+      { ...makeMeasurement('m2'), serverId: 'srv-2' },
+      { ...makeMeasurement('m3'), serverId: 'srv-3' },
+    ];
+    const { result } = renderHook(() =>
+      useMeasurementPersistence({
+        fileName: 'seq.pdf', documentId: DOC, measurements: rows,
+        setMeasurements: vi.fn(), pageScales: basePageScales, setPageScales: vi.fn(),
+        scale: defaultScale, projectId: PROJECT,
+      }),
+    );
+    await act(async () => { await Promise.resolve(); });
+
+    act(() => {
+      result.current.persistOrderKeys([
+        { id: 'm1', orderKey: 'a1' },
+        { id: 'm2', orderKey: 'a2' },
+        { id: 'm3', orderKey: 'a3' },
+      ]);
+    });
+    await waitFor(() =>
+      expect(takeoffApi.update).toHaveBeenCalledTimes(3),
+    );
+    const calls = (takeoffApi.update as unknown as ReturnType<typeof vi.fn>).mock.calls;
+    // Queue order, one at a time, each body writing exactly the one key.
+    expect(calls.map((c) => c[0])).toEqual(['srv-1', 'srv-2', 'srv-3']);
+    expect(calls.map((c) => c[1])).toEqual([
+      { metadata: { order_key: 'a1' } },
+      { metadata: { order_key: 'a2' } },
+      { metadata: { order_key: 'a3' } },
+    ]);
+    expect(maxInFlight).toBe(1);
+    // Fully acked: the persisted resume state is empty again.
+    await waitFor(() => {
+      const payload = JSON.parse(localStorage.getItem(compositeKey)!);
+      expect(payload.orderQueue).toEqual([]);
+      expect(payload.pendingOrderKeys).toEqual([]);
+    });
+  });
+
+  it('an interrupted flush keeps the un-acked suffix queued and resumes after remount', async () => {
+    const { takeoffApi } = await import('@/features/takeoff/api');
+    // First write lands, second fails (network drop): the drain must stop —
+    // the server now holds a PREFIX of the writes (an order every client
+    // already sees) — and persist the remaining queue for resume.
+    let call = 0;
+    (takeoffApi.update as unknown as ReturnType<typeof vi.fn>).mockImplementation(
+      async () => {
+        call += 1;
+        if (call === 2) throw new Error('network');
+        return {};
+      },
+    );
+    const rows = [
+      { ...makeMeasurement('m1'), serverId: 'srv-1' },
+      { ...makeMeasurement('m2'), serverId: 'srv-2' },
+      { ...makeMeasurement('m3'), serverId: 'srv-3' },
+    ];
+    const { result, unmount } = renderHook(() =>
+      useMeasurementPersistence({
+        fileName: 'resume.pdf', documentId: DOC, measurements: rows,
+        setMeasurements: vi.fn(), pageScales: basePageScales, setPageScales: vi.fn(),
+        scale: defaultScale, projectId: PROJECT,
+      }),
+    );
+    await act(async () => { await Promise.resolve(); });
+
+    await act(async () => {
+      result.current.persistOrderKeys([
+        { id: 'm1', orderKey: 'a1' },
+        { id: 'm2', orderKey: 'a2' },
+        { id: 'm3', orderKey: 'a3' },
+      ]);
+      await Promise.resolve();
+    });
+    await waitFor(() => expect(takeoffApi.update).toHaveBeenCalledTimes(2));
+    // m1 acked; m2 failed mid-write; m2+m3 remain queued (and pending).
+    const payload = JSON.parse(localStorage.getItem(compositeKey)!);
+    expect(payload.orderQueue).toEqual([
+      { id: 'm2', field: 'order', orderKey: 'a2' },
+      { id: 'm3', field: 'order', orderKey: 'a3' },
+    ]);
+    expect([...payload.pendingOrderKeys].sort()).toEqual(['order:m2', 'order:m3']);
+
+    unmount();
+
+    // Reload: the server has the prefix (m1's key); the queue must drain the
+    // suffix from exactly the failed write.
+    (takeoffApi.update as unknown as ReturnType<typeof vi.fn>).mockReset().mockResolvedValue({});
+    (takeoffApi.list as unknown as ReturnType<typeof vi.fn>).mockResolvedValue([
+      apiOrderRow('srv-1', 'm1', '2026-07-19T10:00:00Z', 'a1'),
+      apiOrderRow('srv-2', 'm2', '2026-07-19T10:01:00Z'),
+      apiOrderRow('srv-3', 'm3', '2026-07-19T10:02:00Z'),
+    ]);
+    renderHook(() =>
+      useMeasurementPersistence({
+        fileName: 'resume.pdf', documentId: DOC, measurements: [],
+        setMeasurements: vi.fn(), pageScales: basePageScales, setPageScales: vi.fn(),
+        scale: defaultScale, projectId: PROJECT,
+      }),
+    );
+    await waitFor(() => {
+      const resumed = (takeoffApi.update as unknown as ReturnType<typeof vi.fn>).mock.calls;
+      expect(resumed).toEqual([
+        ['srv-2', { metadata: { order_key: 'a2' } }],
+        ['srv-3', { metadata: { order_key: 'a3' } }],
+      ]);
+    });
+  });
+
+  it('bulkCreate baselines from the SENT snapshot so a mid-flight edit still PATCHes', async () => {
+    vi.useFakeTimers();
+    const { takeoffApi } = await import('@/features/takeoff/api');
+    let resolveCreate!: (rows: unknown[]) => void;
+    (takeoffApi.bulkCreate as unknown as ReturnType<typeof vi.fn>).mockImplementation(
+      () => new Promise((r) => { resolveCreate = r; }),
+    );
+    (takeoffApi.update as unknown as ReturnType<typeof vi.fn>).mockResolvedValue({
+      measurement_value: 2.5, metadata: {},
+    });
+    const m1 = makeMeasurement('m1');
+    let rows: TestMeasurement[] = [m1];
+    const setM = vi.fn();
+    const { rerender } = renderHook(() =>
+      useMeasurementPersistence({
+        fileName: 'baseline.pdf', documentId: DOC, measurements: rows,
+        setMeasurements: setM, pageScales: basePageScales, setPageScales: vi.fn(),
+        scale: defaultScale, projectId: PROJECT,
+      }),
+    );
+
+    // Past the 3s debounce the create goes out with the ORIGINAL annotation.
+    await act(async () => {
+      vi.advanceTimersByTime(3500);
+      await Promise.resolve();
+    });
+    expect(takeoffApi.bulkCreate).toHaveBeenCalledTimes(1);
+
+    // Edit the row WHILE the create is in flight.
+    rows = [{ ...m1, annotation: 'edited-mid-flight' }];
+    rerender();
+
+    // The create resolves against the OLD (sent) snapshot.
+    await act(async () => {
+      resolveCreate([{ id: 'srv-1', metadata: { frontend_id: 'm1' } }]);
+      await Promise.resolve();
+    });
+
+    // The hook stamped serverId onto the latest (edited) row; mirror the
+    // parent state update.
+    const stamped = setM.mock.calls[setM.mock.calls.length - 1]![0] as TestMeasurement[];
+    expect(stamped[0]!.serverId).toBe('srv-1');
+    expect(stamped[0]!.annotation).toBe('edited-mid-flight');
+    rows = stamped;
+    rerender();
+
+    // The baseline must be the SENT signature, so the mid-flight edit reads
+    // dirty and re-PATCHes. (Seeding from the by-then-current state would
+    // silently mark the edit synced — it would never reach the server.)
+    await act(async () => {
+      vi.advanceTimersByTime(500);
+      await Promise.resolve();
+    });
+    const patch = (takeoffApi.update as unknown as ReturnType<typeof vi.fn>).mock.calls
+      .find((c) => c[0] === 'srv-1' && c[1]?.annotation !== undefined);
+    expect(patch).toBeDefined();
+    expect(patch![1].annotation).toBe('edited-mid-flight');
+
+    vi.useRealTimers();
+  });
+
+  it('the debounced PATCH skips a row whose order write is still queued', async () => {
+    vi.useFakeTimers();
+    const { takeoffApi } = await import('@/features/takeoff/api');
+    // The order flush is down (server rejecting): the key write stays queued.
+    (takeoffApi.update as unknown as ReturnType<typeof vi.fn>).mockRejectedValue(
+      new Error('down'),
+    );
+    const m1 = { ...makeMeasurement('m1'), serverId: 'srv-1' };
+    let rows: TestMeasurement[] = [m1];
+    const setM = vi.fn();
+    const { result, rerender } = renderHook(() =>
+      useMeasurementPersistence({
+        fileName: 'skip.pdf', documentId: DOC, measurements: rows,
+        setMeasurements: setM, pageScales: basePageScales, setPageScales: vi.fn(),
+        scale: defaultScale, projectId: PROJECT,
+      }),
+    );
+    await act(async () => { await Promise.resolve(); });
+
+    await act(async () => {
+      result.current.persistOrderKeys([{ id: 'm1', orderKey: 'a1' }]);
+      await Promise.resolve();
+    });
+    const metadataOnlyCalls = () =>
+      (takeoffApi.update as unknown as ReturnType<typeof vi.fn>).mock.calls;
+    expect(metadataOnlyCalls()).toHaveLength(1); // the failed key write
+
+    // The row also goes field-dirty while its key write is queued. The
+    // debounced PATCH must SKIP it: a concurrent full-body PATCH (which
+    // carries the final key) could land a non-prefix key subset that
+    // reorders the document for other clients mid-flush.
+    rows = [{ ...m1, annotation: 'renamed' }];
+    rerender();
+    await act(async () => {
+      vi.advanceTimersByTime(600);
+      await Promise.resolve();
+    });
+    expect(
+      metadataOnlyCalls().filter((c) => c[1]?.group_name !== undefined),
+    ).toHaveLength(0);
+
+    // Server back up: the queue drains, the row leaves the pending set, and
+    // the field edit PATCHes on the next pass.
+    (takeoffApi.update as unknown as ReturnType<typeof vi.fn>).mockResolvedValue({
+      measurement_value: 2.5, metadata: {},
+    });
+    await act(async () => {
+      result.current.persistOrderKeys([{ id: 'm1', orderKey: 'a1' }]);
+      await Promise.resolve();
+    });
+    rows = [...rows];
+    rerender();
+    await act(async () => {
+      vi.advanceTimersByTime(600);
+      await Promise.resolve();
+    });
+    const fullPatch = metadataOnlyCalls().find(
+      (c) => c[1]?.group_name !== undefined,
+    );
+    expect(fullPatch).toBeDefined();
+    expect(fullPatch![1].annotation).toBe('renamed');
+
+    vi.useRealTimers();
+  });
+
+  /* ── Persisted GROUP order (metadata.group_order_* triples) ── */
+
+  // Server row factory with a group name and an optional mirrored triple.
+  const groupRow = (
+    serverId: string,
+    frontendId: string,
+    group: string,
+    createdAt: string,
+    triple?: { key: string; rev: number; actor: string },
+  ) => ({
+    ...apiOrderRow(serverId, frontendId, createdAt),
+    group_name: group,
+    metadata: {
+      frontend_id: frontendId,
+      scale_calibrated: false,
+      ...(triple
+        ? {
+            group_order_key: triple.key,
+            group_order_rev: triple.rev,
+            group_order_actor: triple.actor,
+          }
+        : {}),
+    },
+  });
+
+  it('hydrates group-order triples from server metadata into the band map', async () => {
+    const { takeoffApi } = await import('@/features/takeoff/api');
+    (takeoffApi.list as unknown as ReturnType<typeof vi.fn>).mockResolvedValueOnce([
+      groupRow('srv-1', 'm1', 'Walls', '2026-07-19T10:00:00Z', { key: 'a2', rev: 1, actor: 'A' }),
+      groupRow('srv-2', 'm2', 'General', '2026-07-19T10:01:00Z', { key: 'a1', rev: 1, actor: 'A' }),
+    ]);
+    const setM = vi.fn();
+    const { result } = renderHook(() =>
+      useMeasurementPersistence({
+        fileName: 'go.pdf', documentId: DOC, measurements: [],
+        setMeasurements: setM, pageScales: basePageScales, setPageScales: vi.fn(),
+        scale: defaultScale, projectId: PROJECT,
+      }),
+    );
+    await waitFor(() => expect(setM).toHaveBeenCalled());
+    await waitFor(() =>
+      expect(result.current.groupOrderKeys).toEqual({
+        Walls: { key: 'a2', rev: 1, actor: 'A' },
+        General: { key: 'a1', rev: 1, actor: 'A' },
+      }),
+    );
+    // Rows carry the parsed triples too.
+    const loaded = setM.mock.calls[setM.mock.calls.length - 1]![0] as TestMeasurement[];
+    expect(loaded.find((m) => m.id === 'm1')!.groupOrder).toEqual({ key: 'a2', rev: 1, actor: 'A' });
+  });
+
+  it('fold-back adopts the NEWEST observed triple for a group (recency, not position)', async () => {
+    const { takeoffApi } = await import('@/features/takeoff/api');
+    // Two rows of one group disagree (an interrupted stamp elsewhere): the
+    // (rev, actor)-newer triple must win regardless of row order.
+    (takeoffApi.list as unknown as ReturnType<typeof vi.fn>).mockResolvedValueOnce([
+      groupRow('srv-1', 'm1', 'General', '2026-07-19T10:00:00Z', { key: 'a1', rev: 1, actor: 'B' }),
+      groupRow('srv-2', 'm2', 'General', '2026-07-19T10:01:00Z', { key: 'a2', rev: 2, actor: 'A' }),
+    ]);
+    const setM = vi.fn();
+    const { result } = renderHook(() =>
+      useMeasurementPersistence({
+        fileName: 'go.pdf', documentId: DOC, measurements: [],
+        setMeasurements: setM, pageScales: basePageScales, setPageScales: vi.fn(),
+        scale: defaultScale, projectId: PROJECT,
+      }),
+    );
+    await waitFor(() => expect(setM).toHaveBeenCalled());
+    await waitFor(() =>
+      expect(result.current.groupOrderKeys.General).toEqual({ key: 'a2', rev: 2, actor: 'A' }),
+    );
+  });
+
+  it('reconcile: a NEWER local triple survives a stale server copy', async () => {
+    const { takeoffApi } = await import('@/features/takeoff/api');
+    localStorage.setItem(compositeKey, JSON.stringify({
+      measurements: [{
+        ...makeMeasurement('m1'), serverId: 'srv-1',
+        groupOrder: { key: 'a3', rev: 2, actor: 'B' },
+      }],
+      scale: defaultScale,
+      savedAt: 1,
+    }));
+    (takeoffApi.list as unknown as ReturnType<typeof vi.fn>).mockResolvedValueOnce([
+      groupRow('srv-1', 'm1', 'General', '2026-07-19T10:00:00Z', { key: 'a1', rev: 1, actor: 'A' }),
+    ]);
+    const setM = vi.fn();
+    const { result } = renderHook(() =>
+      useMeasurementPersistence({
+        fileName: 'go.pdf', documentId: DOC, measurements: [],
+        setMeasurements: setM, pageScales: basePageScales, setPageScales: vi.fn(),
+        scale: defaultScale, projectId: PROJECT,
+      }),
+    );
+    await waitFor(() => expect(setM).toHaveBeenCalled());
+    const loaded = setM.mock.calls[setM.mock.calls.length - 1]![0] as TestMeasurement[];
+    expect(loaded[0]!.groupOrder).toEqual({ key: 'a3', rev: 2, actor: 'B' });
+    await waitFor(() =>
+      expect(result.current.groupOrderKeys.General).toEqual({ key: 'a3', rev: 2, actor: 'B' }),
+    );
+  });
+
+  it('applyGroupOrder stamps member rows and drains per-row triple PATCHes', async () => {
+    const { takeoffApi } = await import('@/features/takeoff/api');
+    const rows = [
+      { ...makeMeasurement('m1'), serverId: 'srv-1' },
+      { ...makeMeasurement('m2'), serverId: 'srv-2', group: 'Walls' },
+    ];
+    const setM = vi.fn();
+    const { result } = renderHook(() =>
+      useMeasurementPersistence({
+        fileName: 'go.pdf', documentId: DOC, measurements: rows,
+        setMeasurements: setM, pageScales: basePageScales, setPageScales: vi.fn(),
+        scale: defaultScale, projectId: PROJECT,
+      }),
+    );
+    await act(async () => { await Promise.resolve(); });
+
+    const entry = { key: 'a1', rev: 1, actor: 'tab' };
+    act(() => {
+      result.current.applyGroupOrder([{ group: 'General', entry }]);
+    });
+    await waitFor(() =>
+      expect(takeoffApi.update).toHaveBeenCalledWith('srv-1', {
+        metadata: { group_order_key: 'a1', group_order_rev: 1, group_order_actor: 'tab' },
+      }),
+    );
+    // Only the member row is written; the other group's row is untouched, and
+    // the triple stamp does NOT trigger a full-body PATCH (queue exclusivity).
+    expect(takeoffApi.update).toHaveBeenCalledTimes(1);
+    expect(result.current.groupOrderKeys.General).toEqual(entry);
+    // The stamp reached React state (the mock setter never feeds the prop
+    // back, so replay the recorded dispatches over the initial rows).
+    const stamped = replayDispatches(setM, rows);
+    expect(stamped.find((m) => m.id === 'm1')!.groupOrder).toEqual(entry);
+    expect(stamped.find((m) => m.id === 'm2')!.groupOrder).toBeUndefined();
+  });
+
+  it('applyGroupOrder withGroupName carries group_name on the same PATCH (rename path)', async () => {
+    const { takeoffApi } = await import('@/features/takeoff/api');
+    // The viewer has already rewritten the rows to the new name; the queued
+    // write must land name + triple atomically per row.
+    const rows = [{ ...makeMeasurement('m1'), serverId: 'srv-1', group: 'Walls' }];
+    const { result } = renderHook(() =>
+      useMeasurementPersistence({
+        fileName: 'go.pdf', documentId: DOC, measurements: rows,
+        setMeasurements: vi.fn(), pageScales: basePageScales, setPageScales: vi.fn(),
+        scale: defaultScale, projectId: PROJECT,
+      }),
+    );
+    await act(async () => { await Promise.resolve(); });
+
+    const entry = { key: 'a1', rev: 1, actor: 'tab' };
+    act(() => {
+      result.current.applyGroupOrder([{ group: 'Walls', entry, withGroupName: true }]);
+    });
+    await waitFor(() =>
+      expect(takeoffApi.update).toHaveBeenCalledWith('srv-1', {
+        group_name: 'Walls',
+        metadata: { group_order_key: 'a1', group_order_rev: 1, group_order_actor: 'tab' },
+      }),
+    );
+  });
+
+  it('applyGroupOrder stamp does not clobber a same-tick functional rename', async () => {
+    // The rename flow dispatches its row rewrite (group name change) as a
+    // functional update and calls applyGroupOrder in the SAME tick (with
+    // memberIds, because the rewrite has not flushed). The stamp must also
+    // be functional: a value dispatch built from the ref snapshot would
+    // re-apply the pre-rename groups after React flushes the rename, and
+    // the autosave would then PATCH the old name back over the server.
+    const { result } = renderHook(() => {
+      const [ms, setMs] = useState<TestMeasurement[]>([
+        { ...makeMeasurement('m1'), serverId: 'srv-1', group: 'Walls' },
+      ]);
+      const hook = useMeasurementPersistence({
+        fileName: 'go.pdf', documentId: DOC,
+        measurements: ms as Parameters<typeof useMeasurementPersistence>[0]['measurements'],
+        setMeasurements: setMs as Parameters<typeof useMeasurementPersistence>[0]['setMeasurements'],
+        pageScales: basePageScales, setPageScales: vi.fn(),
+        scale: defaultScale, projectId: PROJECT,
+      });
+      return { ms, setMs, hook };
+    });
+    await act(async () => { await Promise.resolve(); });
+
+    const entry = { key: 'a1', rev: 2, actor: 'tab' };
+    act(() => {
+      // The viewer's rename: functional rewrite of the rows…
+      result.current.setMs((prev) =>
+        prev.map((m) => (m.group === 'Walls' ? { ...m, group: 'Rooms' } : m)),
+      );
+      // …then the band-entry transfer stamp in the same tick.
+      result.current.hook.applyGroupOrder([
+        { group: 'Rooms', entry, withGroupName: true, memberIds: ['m1'] },
+      ]);
+    });
+    const row = result.current.ms.find((m) => m.id === 'm1')!;
+    expect(row.group).toBe('Rooms'); // the rename survived the stamp
+    expect(row.groupOrder).toEqual(entry); // and the stamp landed
+  });
+
+  it('retains a group-order write for an unsynced row until its create lands', async () => {
+    vi.useFakeTimers();
+    const { takeoffApi } = await import('@/features/takeoff/api');
+    (takeoffApi.bulkCreate as unknown as ReturnType<typeof vi.fn>).mockResolvedValue([
+      { id: 'srv-1', metadata: { frontend_id: 'm1' } },
+    ]);
+    // m1 has NO serverId yet. Its triple cannot ride toApiUpdate (triples are
+    // queue-exclusive), so the queued write must be RETAINED — not dropped —
+    // until the create supplies a serverId, then drain. Mirror the parent
+    // state so the hook's stamp lands back in the ``measurements`` prop, as
+    // the real viewer setter does.
+    let rows: TestMeasurement[] = [makeMeasurement('m1')];
+    const setM = vi.fn((next: unknown) => {
+      rows = typeof next === 'function'
+        ? (next as (p: TestMeasurement[]) => TestMeasurement[])(rows)
+        : (next as TestMeasurement[]);
+    });
+    const { result, rerender } = renderHook(() =>
+      useMeasurementPersistence({
+        fileName: 'go.pdf', documentId: DOC, measurements: rows,
+        setMeasurements: setM, pageScales: basePageScales, setPageScales: vi.fn(),
+        scale: defaultScale, projectId: PROJECT,
+      }),
+    );
+    await act(async () => { await Promise.resolve(); });
+
+    const entry = { key: 'a1', rev: 1, actor: 'tab' };
+    await act(async () => {
+      result.current.applyGroupOrder([{ group: 'General', entry }]);
+      await Promise.resolve();
+    });
+    rerender();
+    // No PATCH possible yet; the entry stays queued.
+    expect(takeoffApi.update).not.toHaveBeenCalled();
+    act(() => { result.current.saveNow(); });
+    const payload = JSON.parse(localStorage.getItem(compositeKey)!);
+    expect(payload.orderQueue).toEqual([
+      { id: 'm1', field: 'group_order', groupOrder: entry },
+    ]);
+
+    // The debounced create fires; its body carries the stamped triple, and the
+    // post-create re-drain flushes the retained queue entry as a PATCH.
+    await act(async () => {
+      vi.advanceTimersByTime(3500);
+      await Promise.resolve();
+    });
+    expect(takeoffApi.bulkCreate).toHaveBeenCalled();
+    const created = (takeoffApi.bulkCreate as unknown as ReturnType<typeof vi.fn>)
+      .mock.calls[0]![0][0];
+    expect(created.metadata.group_order_key).toBe('a1');
+    expect(created.metadata.group_order_rev).toBe(1);
+    // The post-create re-drain is purely promise-driven; hand the clock back
+    // to real timers so waitFor can poll it.
+    vi.useRealTimers();
+    await waitFor(() =>
+      expect(takeoffApi.update).toHaveBeenCalledWith('srv-1', {
+        metadata: { group_order_key: 'a1', group_order_rev: 1, group_order_actor: 'tab' },
+      }),
+    );
+  });
+
+  it('does not re-enqueue an already-applied equal triple (dedup under a down server)', async () => {
+    const { takeoffApi } = await import('@/features/takeoff/api');
+    (takeoffApi.update as unknown as ReturnType<typeof vi.fn>).mockRejectedValue(
+      new Error('down'),
+    );
+    const rows = [{ ...makeMeasurement('m1'), serverId: 'srv-1' }];
+    const { result } = renderHook(() =>
+      useMeasurementPersistence({
+        fileName: 'go.pdf', documentId: DOC, measurements: rows,
+        setMeasurements: vi.fn(), pageScales: basePageScales, setPageScales: vi.fn(),
+        scale: defaultScale, projectId: PROJECT,
+      }),
+    );
+    await act(async () => { await Promise.resolve(); });
+
+    const entry = { key: 'a1', rev: 1, actor: 'tab' };
+    await act(async () => {
+      result.current.applyGroupOrder([{ group: 'General', entry }]);
+      await Promise.resolve();
+    });
+    // Second apply of the SAME entry (e.g. the convergence effect re-running):
+    // the failed write stays queued exactly once.
+    await act(async () => {
+      result.current.applyGroupOrder([{ group: 'General', entry }]);
+      await Promise.resolve();
+    });
+    act(() => { result.current.saveNow(); });
+    const payload = JSON.parse(localStorage.getItem(compositeKey)!);
+    expect(
+      payload.orderQueue.filter(
+        (e: { id: string; field: string }) => e.id === 'm1' && e.field === 'group_order',
+      ),
+    ).toHaveLength(1);
+  });
+
+  it('legacy group-order queue entries with a corrupt triple are dropped on migration', async () => {
+    const { takeoffApi } = await import('@/features/takeoff/api');
+    // A persisted queue holding one valid order write, one valid group write
+    // and one corrupt group write (bad rev): migration keeps the two valid
+    // entries and discards the corrupt one instead of poisoning the drain.
+    localStorage.setItem(compositeKey, JSON.stringify({
+      measurements: [{ ...makeMeasurement('m1'), serverId: 'srv-1', orderKey: 'a1' }],
+      scale: defaultScale,
+      savedAt: 1,
+      orderQueue: [
+        { id: 'm1', orderKey: 'a1' },
+        { id: 'm1', field: 'group_order', groupOrder: { key: 'a1', rev: 1, actor: 'tab' } },
+        { id: 'm1', field: 'group_order', groupOrder: { key: 'a2', rev: -5, actor: '' } },
+      ],
+      pendingOrderKeys: ['m1'],
+    }));
+    (takeoffApi.list as unknown as ReturnType<typeof vi.fn>).mockResolvedValueOnce([
+      groupRow('srv-1', 'm1', 'General', '2026-07-19T10:00:00Z'),
+    ]);
+    const setM = vi.fn();
+    renderHook(() =>
+      useMeasurementPersistence({
+        fileName: 'go.pdf', documentId: DOC, measurements: [],
+        setMeasurements: setM, pageScales: basePageScales, setPageScales: vi.fn(),
+        scale: defaultScale, projectId: PROJECT,
+      }),
+    );
+    await waitFor(() => expect(setM).toHaveBeenCalled());
+    // Both surviving writes drain in order; the corrupt entry never fires.
+    await waitFor(() => {
+      const calls = (takeoffApi.update as unknown as ReturnType<typeof vi.fn>).mock.calls;
+      expect(calls).toEqual([
+        ['srv-1', { metadata: { order_key: 'a1' } }],
+        ['srv-1', { metadata: { group_order_key: 'a1', group_order_rev: 1, group_order_actor: 'tab' } }],
+      ]);
+    });
+  });
+
+  it('persistRowGroupOrder PATCHes a crossed row to the destination band triple', async () => {
+    const { takeoffApi } = await import('@/features/takeoff/api');
+    // The viewer has already rewritten the row (group + mirrored triple) in
+    // its own state update; this call only queues the per-row write.
+    const rows = [{ ...makeMeasurement('m1'), serverId: 'srv-1', group: 'Walls' }];
+    const { result } = renderHook(() =>
+      useMeasurementPersistence({
+        fileName: 'go.pdf', documentId: DOC, measurements: rows,
+        setMeasurements: vi.fn(), pageScales: basePageScales, setPageScales: vi.fn(),
+        scale: defaultScale, projectId: PROJECT,
+      }),
+    );
+    await act(async () => { await Promise.resolve(); });
+
+    const dest = { key: 'a2', rev: 3, actor: 'tab' };
+    act(() => {
+      result.current.persistRowGroupOrder([{ id: 'm1', entry: dest }]);
+    });
+    await waitFor(() =>
+      expect(takeoffApi.update).toHaveBeenCalledWith('srv-1', {
+        metadata: { group_order_key: 'a2', group_order_rev: 3, group_order_actor: 'tab' },
+      }),
+    );
+    expect(takeoffApi.update).toHaveBeenCalledTimes(1);
+  });
+
+  it('persistRowGroupOrder null CLEARS the server triple (keyless destination band)', async () => {
+    const { takeoffApi } = await import('@/features/takeoff/api');
+    // A row moved into a KEYLESS band must not keep its old band's triple on
+    // the server either, or a fresh hydration re-teaches the map the old key
+    // for the new group and bands silently reorder.
+    const rows = [{ ...makeMeasurement('m1'), serverId: 'srv-1', group: 'Keyless' }];
+    const { result } = renderHook(() =>
+      useMeasurementPersistence({
+        fileName: 'go.pdf', documentId: DOC, measurements: rows,
+        setMeasurements: vi.fn(), pageScales: basePageScales, setPageScales: vi.fn(),
+        scale: defaultScale, projectId: PROJECT,
+      }),
+    );
+    await act(async () => { await Promise.resolve(); });
+
+    act(() => {
+      result.current.persistRowGroupOrder([{ id: 'm1', entry: null }]);
+    });
+    await waitFor(() =>
+      expect(takeoffApi.update).toHaveBeenCalledWith('srv-1', {
+        metadata: {
+          group_order_key: null,
+          group_order_rev: null,
+          group_order_actor: null,
+        },
+      }),
+    );
+  });
+
+  it('a queued triple CLEAR survives reload (migration keeps groupOrder: null)', async () => {
+    const { takeoffApi } = await import('@/features/takeoff/api');
+    localStorage.setItem(compositeKey, JSON.stringify({
+      measurements: [{ ...makeMeasurement('m1'), serverId: 'srv-1' }],
+      scale: defaultScale,
+      savedAt: 1,
+      orderQueue: [{ id: 'm1', field: 'group_order', groupOrder: null }],
+      pendingOrderKeys: ['group_order:m1'],
+    }));
+    (takeoffApi.list as unknown as ReturnType<typeof vi.fn>).mockResolvedValueOnce([
+      groupRow('srv-1', 'm1', 'General', '2026-07-19T10:00:00Z'),
+    ]);
+    const setM = vi.fn();
+    renderHook(() =>
+      useMeasurementPersistence({
+        fileName: 'go.pdf', documentId: DOC, measurements: [],
+        setMeasurements: setM, pageScales: basePageScales, setPageScales: vi.fn(),
+        scale: defaultScale, projectId: PROJECT,
+      }),
+    );
+    await waitFor(() => expect(setM).toHaveBeenCalled());
+    await waitFor(() =>
+      expect(takeoffApi.update).toHaveBeenCalledWith('srv-1', {
+        metadata: {
+          group_order_key: null,
+          group_order_rev: null,
+          group_order_actor: null,
+        },
+      }),
+    );
+  });
+
+  it('persistRowGroupOrder dedups an identical queued write (down server)', async () => {
+    const { takeoffApi } = await import('@/features/takeoff/api');
+    (takeoffApi.update as unknown as ReturnType<typeof vi.fn>).mockRejectedValue(
+      new Error('down'),
+    );
+    const rows = [{ ...makeMeasurement('m1'), serverId: 'srv-1' }];
+    const { result } = renderHook(() =>
+      useMeasurementPersistence({
+        fileName: 'go.pdf', documentId: DOC, measurements: rows,
+        setMeasurements: vi.fn(), pageScales: basePageScales, setPageScales: vi.fn(),
+        scale: defaultScale, projectId: PROJECT,
+      }),
+    );
+    await act(async () => { await Promise.resolve(); });
+
+    await act(async () => {
+      result.current.persistRowGroupOrder([{ id: 'm1', entry: null }]);
+      await Promise.resolve();
+    });
+    await act(async () => {
+      result.current.persistRowGroupOrder([{ id: 'm1', entry: null }]);
+      await Promise.resolve();
+    });
+    act(() => { result.current.saveNow(); });
+    const payload = JSON.parse(localStorage.getItem(compositeKey)!);
+    expect(
+      payload.orderQueue.filter(
+        (e: { id: string; field: string }) => e.id === 'm1' && e.field === 'group_order',
+      ),
+    ).toHaveLength(1);
   });
 });

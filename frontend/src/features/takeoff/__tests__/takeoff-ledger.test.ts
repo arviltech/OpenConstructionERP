@@ -103,6 +103,18 @@ describe('sortMeasurements', () => {
     expect(sorted.map((m) => m.value)).toEqual([20, 15, 10, 5, 3]);
   });
 
+  it("'ordinal' preserves the caller's input order (the presentation projection)", () => {
+    // Deliberately NOT id-sorted input: the default column must keep the
+    // order the viewer passed (band-major projection), not resort by id.
+    const fixture = [
+      m({ id: 'c', group: 'Floors' }),
+      m({ id: 'a', group: 'Walls' }),
+      m({ id: 'b', group: 'Walls' }),
+    ];
+    expect(sortMeasurements(fixture, 'ordinal', 'asc').map((x) => x.id)).toEqual(['c', 'a', 'b']);
+    expect(sortMeasurements(fixture, 'ordinal', 'desc').map((x) => x.id)).toEqual(['b', 'a', 'c']);
+  });
+
   it('toggle asc ↔ desc with the same column flips order', () => {
     const fixture = fiveFixture();
     const asc = sortMeasurements(fixture, 'value', 'asc').map((m) => m.id);

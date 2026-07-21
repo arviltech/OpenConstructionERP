@@ -4,6 +4,7 @@ import { describe, it, expect } from 'vitest';
 import {
   computeGroupSummaries,
   formatGroupTotal,
+  moveMeasurementToGroup,
   ANNOTATION_TYPES,
 } from '../lib/takeoff-groups';
 import type { Measurement } from '../lib/takeoff-types';
@@ -29,7 +30,54 @@ function m(partial: Partial<Measurement>): Measurement {
   };
 }
 
+describe('moveMeasurementToGroup', () => {
+  it('moves the targeted measurement while preserving sibling identity and order', () => {
+    const first = m({ id: 'first', group: 'General' });
+    const target = m({ id: 'target', group: 'Structural' });
+    const last = m({ id: 'last', group: 'Electrical' });
+    const measurements = [first, target, last];
+
+    const result = moveMeasurementToGroup(measurements, 'target', 'General');
+
+    expect(result.map((measurement) => measurement.id)).toEqual([
+      'first',
+      'target',
+      'last',
+    ]);
+    expect(result[1]).toEqual({ ...target, group: 'General' });
+    expect(result[0]).toBe(first);
+    expect(result[2]).toBe(last);
+  });
+
+  it('returns the same array when the measurement id is absent', () => {
+    const measurements = [m({ id: 'existing', group: 'General' })];
+
+    expect(moveMeasurementToGroup(measurements, 'missing', 'Structural')).toBe(
+      measurements,
+    );
+  });
+
+  it('returns the same array when the measurement is already in the target group', () => {
+    const measurements = [m({ id: 'target', group: 'Structural' })];
+
+    expect(moveMeasurementToGroup(measurements, 'target', 'Structural')).toBe(
+      measurements,
+    );
+  });
+});
+
 describe('computeGroupSummaries', () => {
+  it('orders rows by the provided band order, unknown names after (by name)', () => {
+    const measurements = [
+      m({ group: 'Alpha', value: 1 }),
+      m({ group: 'Walls', value: 2 }),
+      m({ group: 'Zeta', value: 3 }),
+    ];
+    const result = computeGroupSummaries(measurements, GROUP_COLORS, undefined, ['Zeta', 'Walls']);
+    // Banded names lead in band order; the un-banded name tails by name.
+    expect(result.map((r) => r.name)).toEqual(['Zeta', 'Walls', 'Alpha']);
+  });
+
   it('returns one row per group present', () => {
     const measurements = [
       m({ group: 'General', value: 1 }),

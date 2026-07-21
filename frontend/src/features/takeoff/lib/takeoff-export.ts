@@ -37,6 +37,7 @@ import {
 } from '../../../modules/pdf-takeoff/data/scale-helpers';
 import { ANNOTATION_TYPES } from './takeoff-groups';
 import { effectiveQuantity } from './takeoff-quantity';
+import { presentationOrder, type GroupOrderMap } from './group-order';
 import type { MeasurementSystem } from '@/stores/usePreferencesStore';
 import {
   convertQuantity,
@@ -47,6 +48,10 @@ import {
 /** Shared empty id set so a caller that hides no individual measurement
  *  (every existing caller, and every test) behaves exactly as before. */
 const NO_HIDDEN_MEASUREMENTS: ReadonlySet<string> = new Set<string>();
+
+/** Shared empty band-key map: a caller without persisted group order gets
+ *  the emergent band-major projection, matching the live sidebar/canvas. */
+const NO_GROUP_ORDER: GroupOrderMap = {};
 
 /* ── Public types ────────────────────────────────────────────────── */
 
@@ -61,6 +66,11 @@ export interface ExportContext {
    *  (pass-through), so omitting it leaves the export byte-for-byte as
    *  before this seam existed. */
   measurementSystem?: MeasurementSystem;
+  /** Persisted group band order. Exports iterate the same band-major
+   *  presentation projection the sidebar and canvas use, so tables, group
+   *  blocks and baked z-order match what the user sees. Omitting it keeps
+   *  the emergent (first-appearance) band order. */
+  groupOrderKeys?: GroupOrderMap;
 }
 
 export interface PdfExportContext extends ExportContext {
@@ -223,11 +233,16 @@ export function renderMeasurementsOnCanvas(
     /** Measurement system for the baked value labels. Defaults to metric
      *  (uses the stored metric labels verbatim). */
     measurementSystem?: MeasurementSystem;
+    /** Persisted group band order — the bake paints the same z-planes as
+     *  the live overlay (reversed band-major projection, then annotations,
+     *  then suggestions). Defaults to the emergent band order. */
+    groupOrderKeys?: GroupOrderMap;
   },
 ): void {
   const { pageNumber, dpr, zoom, scale, groupColorMap, hiddenGroups } = options;
   const hiddenMeasurements = options.hiddenMeasurements ?? NO_HIDDEN_MEASUREMENTS;
   const system: MeasurementSystem = options.measurementSystem ?? 'metric';
+  const groupOrderKeys = options.groupOrderKeys ?? NO_GROUP_ORDER;
   ctx.lineWidth = 2 * dpr;
   ctx.font = `${12 * dpr}px sans-serif`;
 
@@ -261,7 +276,19 @@ export function renderMeasurementsOnCanvas(
       !(isAnnotationType(m.type) && hiddenGroups.has('__annotations__')),
   );
 
-  for (const m of visible) {
+  // Mirror the live overlay's z-planes: committed rows in REVERSED
+  // band-major presentation order (sidebar top = painted last = frontmost),
+  // then annotations among themselves in flat order, then AI suggestions.
+  const paintSequence = [
+    ...presentationOrder(
+      visible.filter((m) => !isAnnotationType(m.type) && !m.suggested),
+      groupOrderKeys,
+    ).reverse(),
+    ...visible.filter((m) => isAnnotationType(m.type) && !m.suggested),
+    ...visible.filter((m) => m.suggested),
+  ];
+
+  for (const m of paintSequence) {
     // A per-measurement colour (set via the properties swatch) wins over the
     // group default so a recoloured measurement exports in its chosen colour
     // (issue #299); annotation markups already resolve `m.color` below.
@@ -593,6 +620,7 @@ export async function buildTakeoffPdf(ctx: PdfExportContext): Promise<JsPDF> {
       hiddenGroups: ctx.hiddenGroups,
       hiddenMeasurements,
       measurementSystem: ctx.measurementSystem,
+      groupOrderKeys: ctx.groupOrderKeys,
     });
 
     const imageData = canvas.toDataURL('image/jpeg', jpegQuality);
@@ -649,7 +677,12 @@ function renderPdfSummary(pdf: JsPDF, ctx: PdfExportContext): void {
       !hiddenMeasurements.has(m.id) &&
       !(isAnnotationType(m.type) && ctx.hiddenGroups.has('__annotations__')),
   );
-  const rows = summariseByGroupType(visibleMeasurements, ctx.groupColorMap);
+  // Iterate the band-major projection so summary blocks follow the same
+  // group order as the sidebar and the baked pages.
+  const rows = summariseByGroupType(
+    presentationOrder(visibleMeasurements, ctx.groupOrderKeys ?? NO_GROUP_ORDER),
+    ctx.groupColorMap,
+  );
 
   // Table header
   let y = margin + 72;
@@ -759,15 +792,17 @@ export async function buildTakeoffWorkbook(
   };
   headerRow.alignment = { vertical: 'middle' };
 
-  // Group measurements by group name so subtotal rows live with their data.
+  // Group measurements by group name so subtotal rows live with their data,
+  // blocks in the persisted band-major order (Map insertion order carries
+  // it), matching the sidebar instead of an alphabetical resort.
   const byGroup = new Map<string, Measurement[]>();
-  for (const m of ctx.measurements) {
+  for (const m of presentationOrder(ctx.measurements, ctx.groupOrderKeys ?? NO_GROUP_ORDER)) {
     const g = m.group || 'General';
     const list = byGroup.get(g) ?? [];
     list.push(m);
     byGroup.set(g, list);
   }
-  const sortedGroups = Array.from(byGroup.keys()).sort((a, b) => a.localeCompare(b));
+  const sortedGroups = Array.from(byGroup.keys());
 
   for (const groupName of sortedGroups) {
     const groupMs = byGroup.get(groupName)!;

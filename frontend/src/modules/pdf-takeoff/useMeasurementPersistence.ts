@@ -1,6 +1,6 @@
 // DDC-CWICR-OE: DataDrivenConstruction · OpenConstructionERP
 // Copyright (c) 2026 Artem Boiko / DataDrivenConstruction
-import { useCallback, useContext, useEffect, useRef, useState } from 'react';
+import { useCallback, useContext, useEffect, useRef, useState, type Dispatch, type SetStateAction } from 'react';
 import { QueryClientContext } from '@tanstack/react-query';
 import { takeoffApi, type MeasurementCreate, type MeasurementResponse } from '@/features/takeoff/api';
 import {
@@ -12,6 +12,18 @@ import {
   reconcilePageScales,
   scaleForPage,
 } from './data/page-scales';
+import {
+  compareMeasurements,
+  type OrderAssignment,
+} from '@/features/takeoff/lib/order-key';
+import {
+  compareGroupOrderEntries,
+  maxGroupOrderRev,
+  parseGroupOrderTriple,
+  shouldAdoptGroupOrder,
+  type GroupOrderEntry,
+  type GroupOrderMap,
+} from '@/features/takeoff/lib/group-order';
 
 /* ── Types (mirrored from TakeoffViewerModule) ──────────────────────── */
 
@@ -81,11 +93,94 @@ interface Measurement {
   suggested?: boolean;
   /** Recognition confidence 0..1 on AI-sourced measurements. */
   confidence?: number;
+  /** ISO creation stamp for the canonical ordering tie-break. Mapped from
+   *  the server's `created_at` on hydrate, stamped at build time in-session.
+   *  Display-only ordering data — never sent to the server. */
+  createdAt?: string;
+  /** Persisted z/list-order key (`metadata.order_key`); keyless rows sort
+   *  after every keyed row, in creation order. See lib/order-key.ts. */
+  orderKey?: string;
+  /** This row's GROUP's persisted band-order triple, mirrored onto every
+   *  member row (`metadata.group_order_key/_rev/_actor`) the way the group
+   *  colour is — groups have no server entity. The `(rev, actor)` pair gives
+   *  fold-back recency semantics. See lib/group-order.ts. */
+  groupOrder?: GroupOrderEntry;
 }
 
 interface ScaleConfig {
   pixelsPerUnit: number;
   unitLabel: string;
+}
+
+/**
+ * One queued ordering write. `field` selects what the entry carries:
+ * `'order'` = the row's own fractional key; `'group_order'` = the row's
+ * GROUP's revisioned band triple (optionally with `group` so a rename's
+ * name+triple land atomically per row). Entries are IMMUTABLE once enqueued
+ * — a rename or newer move appends superseding entries instead of mutating
+ * queued ones, so an in-flight PATCH can never race a rewrite.
+ */
+interface OrderFlushEntry {
+  id: string;
+  field: 'order' | 'group_order';
+  orderKey?: string;
+  /** `null` = CLEAR the row's mirrored triple on the server (metadata nulls):
+   *  a row that crossed into a keyless band must not keep its old band's
+   *  triple, or a fresh hydration would re-teach the map the wrong key. */
+  groupOrder?: GroupOrderEntry | null;
+  group?: string;
+}
+
+/** Provenance token for the pending set: per (field, id), because a pending
+ *  row-order write must not shield a stale group triple or vice versa. */
+function pendingToken(field: OrderFlushEntry['field'], id: string): string {
+  return `${field}:${id}`;
+}
+
+/** Normalize a persisted queue on read: a bare `{id, orderKey}` entry (no
+ *  `field`, or an unrecognized one) counts as a row-order write, and an
+ *  entry missing its payload is dropped rather than allowed to stall the
+ *  resumed drain. */
+function migrateOrderQueue(
+  raw: Array<Partial<OrderFlushEntry> & { id: string }> | undefined,
+): OrderFlushEntry[] {
+  if (!raw || !Array.isArray(raw)) return [];
+  const out: OrderFlushEntry[] = [];
+  for (const e of raw) {
+    if (typeof e?.id !== 'string') continue;
+    const field = e.field === 'group_order' ? 'group_order' : 'order';
+    if (field === 'order') {
+      if (typeof e.orderKey === 'string') {
+        out.push({ id: e.id, field, orderKey: e.orderKey });
+      }
+    } else if (e.groupOrder === null) {
+      // A queued CLEAR (cross-band move into a keyless band) survives reload.
+      out.push({ id: e.id, field, groupOrder: null });
+    } else if (e.groupOrder) {
+      const parsed = parseGroupOrderTriple(
+        e.groupOrder.key,
+        e.groupOrder.rev,
+        e.groupOrder.actor,
+      );
+      if (parsed) {
+        out.push({
+          id: e.id,
+          field,
+          groupOrder: parsed,
+          ...(typeof e.group === 'string' ? { group: e.group } : {}),
+        });
+      }
+    }
+  }
+  return out;
+}
+
+/** Normalize a persisted pending token: a bare row id (no field prefix)
+ *  counts as row-order provenance. */
+function migratePendingToken(s: string): string {
+  return s.startsWith('order:') || s.startsWith('group_order:')
+    ? s
+    : pendingToken('order', s);
 }
 
 interface PersistedDocument {
@@ -97,6 +192,20 @@ interface PersistedDocument {
    *  (and still written so a downgrade to an older build keeps working). */
   scale: ScaleConfig;
   savedAt: number;
+  /** Ordering writes not yet acknowledged by the server, in write order
+   *  (the sequential flush drains this front-to-back; see persistOrderKeys).
+   *  Persisted so an interrupted flush resumes after reload. */
+  orderQueue?: OrderFlushEntry[];
+  /** Per-(field, id) provenance tokens (see {@link pendingToken}) for writes
+   *  not yet server-acked. Row-order tokens are what the reconcile key rule
+   *  trusts: a local key wins over the server's only while its token is in
+   *  here; otherwise the server's key wins (a stale tab's old key must not
+   *  roll back a newer server-side move). Group-order tokens track the queue
+   *  only — group triples reconcile by their own (rev, actor) recency. */
+  pendingOrderKeys?: string[];
+  /** The document's group band-order map (group name → revisioned entry),
+   *  persisted in the SAME payload as the queue so the two can never tear. */
+  groupOrderKeys?: GroupOrderMap;
 }
 
 /* ── localStorage helpers (fallback) ─────────────────────────────────── */
@@ -345,6 +454,18 @@ function toApiFormat(
       linked_boq_id: m.linkedBoqId,
       linked_position_ordinal: m.linkedPositionOrdinal,
       linked_position_label: m.linkedPositionLabel,
+      // Persisted z/list order (fractional key). Undefined for a never-placed
+      // row (dropped by JSON), so a keyless row stays keyless server-side.
+      order_key: m.orderKey,
+      // Persisted GROUP band order (revisioned triple, lib/group-order.ts),
+      // mirrored on member rows like the group colour. Carried on CREATE so
+      // an unsynced row's triple ships with the row; on PATCH these fields
+      // are written ONLY by the sequential order flush (never toApiUpdate) —
+      // a debounced echo from a stale row snapshot would bypass the client's
+      // (rev, actor) fold-back gate, and the server merge has no rev check.
+      group_order_key: m.groupOrder?.key,
+      group_order_rev: m.groupOrder?.rev,
+      group_order_actor: m.groupOrder?.actor,
     },
   };
 }
@@ -395,6 +516,16 @@ function syncSignature(m: Measurement): string {
     gc: m.groupColor ?? null,
     a: m.annotation || m.label || null,
     n: m.text ?? null,
+    // Persisted order key: a group move / placement re-keys the row and must
+    // re-sync. Kept LAST so the order flush can surgically patch this one
+    // field into a stored baseline (parse → set → re-stringify keeps order).
+    // The GROUP band triple is deliberately NOT in this signature: it is not
+    // in the toApiUpdate body (queue-exclusive, see there), and including it
+    // would mark every member row dirty on each band stamp — a full-body
+    // PATCH storm alongside the queue's own writes. Triple changes reach the
+    // server through the flush queue only (retained for unsynced rows until
+    // their create returns a serverId).
+    ok: m.orderKey ?? null,
   });
 }
 
@@ -460,6 +591,16 @@ function toApiUpdate(
     linked_boq_id: m.linkedBoqId,
     linked_position_ordinal: m.linkedPositionOrdinal,
     linked_position_label: m.linkedPositionLabel,
+    // Persisted order key rides every PATCH like the appearance overrides
+    // (the server merges metadata, so re-sending the current value is safe
+    // and an omitted undefined never strips a stored key).
+    order_key: m.orderKey,
+    // The GROUP band triple (group_order_key/_rev/_actor) is deliberately
+    // ABSENT here: it is a cross-row SHARED value, so echoing it from this
+    // row's possibly-stale snapshot could overwrite a newer client's move —
+    // the server merge has no rev gate, and the client-side fold-back never
+    // sees a write it didn't make. The sequential order flush is the sole
+    // PATCH writer for those fields (see drainOrderQueue).
   };
   // Always-safe, non-geometry properties (issue #282). These never move the
   // billed quantity and never touch the page scale.
@@ -531,6 +672,17 @@ function fromApiFormat(r: MeasurementResponse): Measurement {
     linkedBoqId: (meta.linked_boq_id as string) ?? undefined,
     linkedPositionOrdinal: (meta.linked_position_ordinal as string) ?? undefined,
     linkedPositionLabel: (meta.linked_position_label as string) ?? undefined,
+    createdAt: r.created_at ?? undefined,
+    orderKey:
+      typeof meta.order_key === 'string' && meta.order_key.length > 0
+        ? meta.order_key
+        : undefined,
+    groupOrder:
+      parseGroupOrderTriple(
+        meta.group_order_key,
+        meta.group_order_rev,
+        meta.group_order_actor,
+      ) ?? undefined,
   };
 }
 
@@ -546,25 +698,63 @@ function fromApiFormat(r: MeasurementResponse): Measurement {
  *     least as new as the server's) but keep the server's ``serverId``. The
  *     load effect seeds the sync baseline from the SERVER signature, so if the
  *     local copy differs it is re-PATCHed on the next tick - never lost.
+ *   - EXCEPTION - the ORDER KEY resolves by provenance, not by prefer-local:
+ *     the local copy's key wins only while the row's id is in
+ *     ``pendingOrderKeys`` (an unsynced local placement); otherwise the
+ *     SERVER key is carried onto the merged row - covering both a stale
+ *     keyless local copy shadowing a keyed server row AND a stale tab's OLD
+ *     key rolling back a newer move made elsewhere (the server metadata
+ *     merge would accept the rollback, so it must not be sent). ``createdAt``
+ *     is likewise carried from the server row when the local copy predates
+ *     the field.
  *   - A local row whose ``serverId`` is no longer on the server was deleted
  *     elsewhere; we drop it (the server is authoritative on existence).
  *
- * When there is no local copy we just return the server rows unchanged.
+ * The merged result is sorted with the canonical comparator (keyed band in
+ * key order, then keyless rows in creation order).
+ *
+ * When there is no local copy we just return the server rows (already
+ * comparator-sorted by the load path) unchanged.
  */
 function reconcileWithLocal(
   serverRows: Measurement[],
   localRows: Measurement[] | undefined,
+  pendingOrderKeys: ReadonlySet<string> = new Set(),
 ): Measurement[] {
   if (!localRows || localRows.length === 0) return serverRows;
   const serverById = new Map(
     serverRows.filter((m) => m.serverId).map((m) => [m.serverId as string, m]),
   );
   // Start from the server rows, swapping in the local copy for any synced row
-  // the user edited locally (prefer local, keep the serverId).
+  // the user edited locally (prefer local, keep the serverId; order key and
+  // createdAt resolve per the provenance rule above).
   const merged = serverRows.map((srv) => {
     if (!srv.serverId) return srv;
     const localEdit = localRows.find((l) => l.serverId === srv.serverId);
-    return localEdit ? { ...localEdit, serverId: srv.serverId } : srv;
+    if (!localEdit) return srv;
+    const keyWinner = pendingOrderKeys.has(pendingToken('order', localEdit.id))
+      ? localEdit.orderKey
+      : srv.orderKey;
+    // The GROUP triple resolves by its own (rev, actor) recency — no
+    // provenance set needed: whichever side is newer wins, deterministically,
+    // and a side with no triple never erases the other's (rule: absence is
+    // ignorance). This also carries a server-only triple onto the preferred
+    // local copy (prefer-local must keep server-only fields).
+    const localGo = localEdit.groupOrder;
+    const srvGo = srv.groupOrder;
+    const goWinner =
+      localGo && srvGo
+        ? compareGroupOrderEntries(localGo, srvGo) >= 0
+          ? localGo
+          : srvGo
+        : localGo ?? srvGo;
+    return {
+      ...localEdit,
+      serverId: srv.serverId,
+      orderKey: keyWinner,
+      groupOrder: goWinner,
+      createdAt: localEdit.createdAt ?? srv.createdAt,
+    };
   });
   // Append unsynced local creates (no serverId, and not already represented).
   for (const l of localRows) {
@@ -576,7 +766,9 @@ function reconcileWithLocal(
   // was deleted elsewhere - it is simply not added back (serverById guards the
   // edit branch above).
   void serverById;
-  return merged;
+  // One canonical sort over the merged result: with keys in play the
+  // server-iteration order is only correct-by-accident for keyless docs.
+  return merged.sort(compareMeasurements);
 }
 
 /**
@@ -631,7 +823,7 @@ interface UseMeasurementPersistenceOptions {
    *  and do NOT sync to the server. */
   documentId: string | null;
   measurements: Measurement[];
-  setMeasurements: (measurements: Measurement[]) => void;
+  setMeasurements: Dispatch<SetStateAction<Measurement[]>>;
   /** Per-page (per-sheet) scale model. Persisted whole; a legacy
    *  single-scale document is migrated into the default on load. */
   pageScales: PageScales;
@@ -671,6 +863,41 @@ interface UseMeasurementPersistenceResult {
    * work instead of firing on every navigation.
    */
   hasUnsavedChanges: () => boolean;
+  /**
+   * Enqueue persisted order-key assignments (from planGroupMove, in the
+   * planner's exact write order) and start the strictly sequential,
+   * ack-tracked server flush. The caller must have already applied the new
+   * keys/order to React state.
+   */
+  persistOrderKeys: (assignments: OrderAssignment[]) => void;
+  /**
+   * The document's group band-order map (group name -> revisioned entry).
+   * The single source the band-major presentation projection reads.
+   */
+  groupOrderKeys: GroupOrderMap;
+  /**
+   * Apply group-order entries (a move plan's phases, an undo restore, or a
+   * rename transfer): updates the map, stamps member rows' mirrored triples,
+   * enqueues the per-row writes and starts the sequential drain.
+   * `withGroupName: true` additionally carries `group_name` on each queued
+   * write (the rename path, where name + triple land atomically per row).
+   */
+  applyGroupOrder: (
+    updates: Array<{ group: string; entry: GroupOrderEntry; withGroupName?: boolean; memberIds?: string[] }>,
+  ) => void;
+  /**
+   * Enqueue a per-ROW mirrored-triple write for a row that crossed bands:
+   * the destination band's entry, or `null` to clear when the destination is
+   * keyless. Enqueue-only — the caller rewrites the row's local `groupOrder`
+   * in the same state update as the group change.
+   */
+  persistRowGroupOrder: (
+    updates: Array<{ id: string; entry: GroupOrderEntry | null }>,
+  ) => void;
+  /** Mint the next document-wide group-order revision (Lamport counter). */
+  mintGroupOrderRev: () => number;
+  /** This tab's unique group-order writer id. */
+  groupOrderActor: string;
 }
 
 export function useMeasurementPersistence({
@@ -739,6 +966,28 @@ export function useMeasurementPersistence({
   const pageScalesSyncRef = useRef<string | null>(null);
   const pageScalesPutTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const prevCanSyncRef = useRef(false);
+  // Persisted-order flush state (see persistOrderKeys): the ordered write
+  // queue (row-order AND group-order entries), the per-(field, id) provenance
+  // token set, and the single-drainer latch that keeps the flush strictly
+  // sequential.
+  const orderQueueRef = useRef<OrderFlushEntry[]>([]);
+  const pendingOrderKeysRef = useRef<Set<string>>(new Set());
+  const orderFlushActiveRef = useRef(false);
+  // Group band-order state (lib/group-order.ts): the name→triple map (state
+  // for render + a ref for callbacks), the document-wide Lamport counter, and
+  // the PER-TAB actor id. The actor is deliberately not persisted: two tabs
+  // sharing a stored id could mint identical (rev, actor) pairs for different
+  // moves, and the total order would have no winner. Queued entries persist
+  // their own recorded triples, so a resumed flush replays the original
+  // actor values.
+  const [groupOrderKeys, setGroupOrderKeys] = useState<GroupOrderMap>({});
+  const groupOrderRef = useRef<GroupOrderMap>({});
+  const groupOrderRevRef = useRef(0);
+  const [groupOrderActor] = useState(() =>
+    typeof crypto !== 'undefined' && typeof crypto.randomUUID === 'function'
+      ? crypto.randomUUID()
+      : `tab-${Math.random().toString(36).slice(2)}${Date.now().toString(36)}`,
+  );
   // Read the QueryClient directly from context — ``useContext`` returns
   // ``undefined`` instead of throwing when the provider is absent (e.g. in
   // unit tests that render the hook in isolation). When present, we use
@@ -807,6 +1056,48 @@ export function useMeasurementPersistence({
       // offline fallback and as the source of local-pending overlay edits.
       const local = localKey ? readKey(localKey) : null;
 
+      // Resume an interrupted order-key flush (see persistOrderKeys): the
+      // queue and its provenance set persist alongside the rows so a reload
+      // mid-flush continues from exactly the next unacked write. Both are
+      // normalized on read (bare {id, orderKey} entries; bare-id pending
+      // tokens; non-array payloads and payload-less entries dropped).
+      orderQueueRef.current = migrateOrderQueue(local?.orderQueue);
+      pendingOrderKeysRef.current = new Set(
+        (Array.isArray(local?.pendingOrderKeys) ? local.pendingOrderKeys : [])
+          .filter((s): s is string => typeof s === 'string')
+          .map(migratePendingToken),
+      );
+      // Seed the group band-order map from the payload and the Lamport
+      // counter from EVERYTHING seen (map + queued triples; row triples fold
+      // in below via seedGroupOrderFromRows) so the next minted rev is
+      // strictly newer than anything this tab can observe.
+      groupOrderRef.current = { ...(local?.groupOrderKeys ?? {}) };
+      let seedRev = maxGroupOrderRev(groupOrderRef.current);
+      for (const e of orderQueueRef.current) {
+        if (e.groupOrder && e.groupOrder.rev > seedRev) seedRev = e.groupOrder.rev;
+      }
+      groupOrderRevRef.current = Math.max(groupOrderRevRef.current, seedRev);
+      // Publish immediately (not only after row fold-back) so an identity
+      // switch that reuses this mount never renders the previous document's
+      // band order — and a data-less fresh document resets to empty.
+      setGroupOrderKeys({ ...groupOrderRef.current });
+
+      /** Fold row-observed triples into the map ((rev, actor) adoption rule)
+       *  and publish it. Runs on whichever branch produced the final rows. */
+      const seedGroupOrderFromRows = (rows: Measurement[]) => {
+        const map = groupOrderRef.current;
+        for (const m of rows) {
+          if (!m.groupOrder) continue;
+          if (shouldAdoptGroupOrder(map[m.group], m.groupOrder)) {
+            map[m.group] = m.groupOrder;
+          }
+          if (m.groupOrder.rev > groupOrderRevRef.current) {
+            groupOrderRevRef.current = m.groupOrder.rev;
+          }
+        }
+        setGroupOrderKeys({ ...map });
+      };
+
       // Try server first, but only with BOTH a project and a stable document
       // UUID. Filename is never sent as the document key any more.
       if (canSync && projectId && documentId) {
@@ -821,16 +1112,30 @@ export function useMeasurementPersistence({
           if (!cancelled && serverData.length > 0) {
             hasPersistedRef.current = true;
             setSyncedToServer(true);
+            // The API lists newest-first (created_at DESC), but in-session
+            // creates append newest-LAST, and array order is the only z-order
+            // the canvas has - hydrating in fetch order inverts the stacking
+            // on every reload. Map first (the rows carry createdAt +
+            // orderKey), then ONE canonical sort: explicitly keyed rows in
+            // key order, keyless rows after them in ascending creation order
+            // (id tie-break) - identical to the plain creation-order sort for
+            // a document that has never been reordered.
             // Drop rows we have locally deleted but not yet synced (#282).
             const pending = pendingDeletesRef.current;
             const mapped = serverData
               .map(fromApiFormat)
-              .filter((m) => !(m.serverId && pending.has(m.serverId)));
+              .filter((m) => !(m.serverId && pending.has(m.serverId)))
+              .sort(compareMeasurements);
 
             // Overlay local-pending work (#281/#282): start from the server
             // rows, then apply the localStorage copy's unsynced creates and
-            // any locally-newer edits to a synced row.
-            const merged = reconcileWithLocal(mapped, local?.measurements);
+            // any locally-newer edits to a synced row (order keys resolve by
+            // pending-write provenance, see reconcileWithLocal).
+            const merged = reconcileWithLocal(
+              mapped,
+              local?.measurements,
+              pendingOrderKeysRef.current,
+            );
 
             // Seed the sync baseline from the SERVER copy of each synced row
             // (not the merged copy), so a locally-newer edit still looks dirty
@@ -862,7 +1167,16 @@ export function useMeasurementPersistence({
                 : null;
             const chosen = reconcilePageScales(localScales, serverScales);
             if (chosen) setPageScalesRef.current(chosen);
+            // Eagerly sync the mirror ref (it is re-assigned identically on
+            // the next render): the drain below looks rows up and persists
+            // through it, and must not see the previous document's state.
+            measurementsRef.current = merged;
             setMeasurementsRef.current(merged);
+            // Learn band order from the merged rows (server triples included)
+            // and publish the map before the drain runs.
+            seedGroupOrderFromRows(merged);
+            // Resume any interrupted order-key flush now that state is live.
+            void drainOrderQueue();
             return;
           }
         } catch {
@@ -907,7 +1221,12 @@ export function useMeasurementPersistence({
               .filter((m) => m.serverId)
               .map((m) => [m.serverId as string, geometrySignature(m)]),
           );
+          // Eager mirror-ref sync for the same reason as the server branch.
+          measurementsRef.current = rows;
           setMeasurementsRef.current(rows);
+          seedGroupOrderFromRows(rows);
+          // Resume any interrupted order-key flush (no-ops while offline).
+          void drainOrderQueue();
           // Graceful migration: a document saved before per-page scale only
           // carried ``data.scale``; hydratePageScales promotes it to the
           // document default so every page reads the same number it always
@@ -942,6 +1261,13 @@ export function useMeasurementPersistence({
       pageScales: pageScalesRef.current,
       scale: scaleRef.current,
       savedAt: Date.now(),
+      // Order-flush resume state rides the same payload so the queue and the
+      // rows it references are always saved together (never one without the
+      // other). The band-order map rides here too — a separate localStorage
+      // key could tear from the queue on an interrupt.
+      orderQueue: [...orderQueueRef.current],
+      pendingOrderKeys: [...pendingOrderKeysRef.current],
+      groupOrderKeys: { ...groupOrderRef.current },
     };
     if (projectIdNow && documentIdNow) {
       saveToStorage(projectIdNow, documentIdNow, payload);
@@ -955,6 +1281,332 @@ export function useMeasurementPersistence({
       }
     }
   }, []);
+
+  // ── Persisted-order flush (strictly sequential, ack-tracked) ─────────
+  // Order-key writes deliberately BYPASS the debounced PATCH pipeline: that
+  // path fires concurrently (Promise.all), and a partially-landed concurrent
+  // key flush can leave the server holding a non-prefix subset that REORDERS
+  // the document on every other client. Assignments queue here in write
+  // order (phase 1: order-preserving materialization at old positions;
+  // phase 2: the coalesce/move writes, moved row last — see planGroupMove)
+  // and drain one PATCH at a time. Interrupt the drain anywhere and the
+  // server holds a prefix of the queue: an order every client already sees.
+  // The queue + its provenance set persist with the rows (writeLocalNow), so
+  // a reload mid-flush resumes from exactly the next unacked write, and the
+  // debounced PATCH effect skips queued rows so the two writers never race.
+  const drainOrderQueue = useCallback(async () => {
+    if (orderQueueRef.current.length === 0) return;
+    if (orderFlushActiveRef.current) return; // single drainer
+    if (!canSyncRef.current) return;
+    orderFlushActiveRef.current = true;
+    let wrote = false;
+    try {
+      // Index-based walk (not head-shift): a group-order entry whose row has
+      // no serverId yet is RETAINED in place and skipped over, so it cannot
+      // block later independent writes and is picked up by the post-create
+      // drain once the row's serverId exists.
+      let i = 0;
+      while (i < orderQueueRef.current.length) {
+        const entry = orderQueueRef.current[i]!;
+        const token = pendingToken(entry.field, entry.id);
+        const clearAckIfLast = () => {
+          if (
+            !orderQueueRef.current.some(
+              (e) => e.id === entry.id && e.field === entry.field,
+            )
+          ) {
+            pendingOrderKeysRef.current.delete(token);
+          }
+        };
+        const row = measurementsRef.current.find((m) => m.id === entry.id);
+        if (!row) {
+          // Deleted while queued — nothing to write.
+          orderQueueRef.current.splice(i, 1);
+          clearAckIfLast();
+          continue;
+        }
+        const serverId = row.serverId;
+        if (!serverId) {
+          if (entry.field === 'order') {
+            // Unsynced row: its key ships inside its bulkCreate metadata, and
+            // the sent-snapshot baseline keeps any later key change dirty
+            // (order_key rides toApiUpdate, so the debounced PATCH is the
+            // safety net).
+            orderQueueRef.current.splice(i, 1);
+            clearAckIfLast();
+            continue;
+          }
+          // Group triples have NO debounced-PATCH safety net (deliberately
+          // excluded from toApiUpdate): a triple minted while the create was
+          // in flight would be lost if this entry were dropped. Retain it —
+          // runServerSync re-drains after serverIds land.
+          i++;
+          continue;
+        }
+        try {
+          // Metadata-only bodies: the server MERGES metadata (service-side),
+          // so each write touches exactly its own fields and cannot clobber
+          // concurrent field edits the way a full update body built from a
+          // stale snapshot would. A group entry carries `group_name` when a
+          // rename needs the name and triple to land atomically per row.
+          const body =
+            entry.field === 'order'
+              ? { metadata: { order_key: entry.orderKey } }
+              : entry.groupOrder === null
+                ? {
+                    // Clear the mirrored triple (cross-band move into a
+                    // keyless band): nulls parse as absent on every reader.
+                    metadata: {
+                      group_order_key: null,
+                      group_order_rev: null,
+                      group_order_actor: null,
+                    },
+                  }
+                : {
+                    ...(entry.group !== undefined
+                      ? { group_name: entry.group }
+                      : {}),
+                    metadata: {
+                      group_order_key: entry.groupOrder!.key,
+                      group_order_rev: entry.groupOrder!.rev,
+                      group_order_actor: entry.groupOrder!.actor,
+                    },
+                  };
+          await takeoffApi.update(serverId, body as Partial<MeasurementCreate>);
+        } catch {
+          // Leave the queue intact (localStorage already has it); the next
+          // mutation, sync, or reload resumes from exactly this write.
+          break;
+        }
+        wrote = true;
+        orderQueueRef.current.splice(i, 1);
+        // Ack: the token leaves the provenance set only when no LATER queued
+        // write still targets the same (field, id) — a superseding move
+        // keeps local-wins for row keys; group tokens only track the queue.
+        clearAckIfLast();
+        // Fold an acked ROW key surgically into the sync baseline so the
+        // debounced PATCH does not re-send it — without touching the other
+        // fields' baseline (those may be genuinely dirty and must stay so).
+        // Group triples need no fold: they are in neither the signature nor
+        // the toApiUpdate body.
+        if (entry.field === 'order') {
+          const prevSig = syncSigRef.current.get(serverId);
+          if (prevSig) {
+            try {
+              const parsed = JSON.parse(prevSig) as Record<string, unknown>;
+              parsed.ok = entry.orderKey;
+              syncSigRef.current.set(serverId, JSON.stringify(parsed));
+            } catch {
+              // Corrupt baseline: leave it; worst case one redundant PATCH.
+            }
+          }
+        }
+      }
+    } finally {
+      orderFlushActiveRef.current = false;
+      // Persist the drained queue state promptly (not just on the debounce).
+      writeLocalNow();
+      if (wrote) {
+        // Identity-refresh the array so the debounced effects re-run: a row
+        // whose OTHER fields went dirty while its order write was queued
+        // gets re-checked now that it is no longer excluded. Functional (not
+        // a copy of the ref snapshot) so it cannot clobber an update queued
+        // in the same flush.
+        setMeasurementsRef.current((prev) => [...prev]);
+      }
+    }
+  }, [writeLocalNow]);
+
+  /**
+   * Enqueue order-key assignments (in the exact write order the planner
+   * produced) and start the sequential drain. The caller has already applied
+   * the keys to React state; the 500ms localStorage debounce persists the
+   * array and this queue together.
+   */
+  const persistOrderKeys = useCallback(
+    (assignments: OrderAssignment[]) => {
+      if (assignments.length === 0) return;
+      for (const a of assignments) {
+        orderQueueRef.current.push({ id: a.id, field: 'order', orderKey: a.orderKey });
+        pendingOrderKeysRef.current.add(pendingToken('order', a.id));
+      }
+      void drainOrderQueue();
+    },
+    [drainOrderQueue],
+  );
+
+  /** Mint a strictly-increasing document-wide group-order revision. */
+  const mintGroupOrderRev = useCallback(
+    () => ++groupOrderRevRef.current,
+    [],
+  );
+
+  /**
+   * Apply group band-order entries (a move's phase-1/phase-2 plan, an undo
+   * restore, or a rename transfer): update the map, stamp every member row's
+   * mirrored triple, enqueue the per-row writes (deduped against entries
+   * already queued), and start the sequential drain. `groupName` on an
+   * update overrides which rows are stamped AND rides the queued entries as
+   * `group_name` — the rename path, where the name and triple must land
+   * atomically per row. Entries already queued are never mutated (an
+   * in-flight PATCH must not race a rewrite); supersession is by APPEND.
+   */
+  const applyGroupOrder = useCallback(
+    (updates: Array<{ group: string; entry: GroupOrderEntry; withGroupName?: boolean; memberIds?: string[] }>) => {
+      if (updates.length === 0) return;
+      const map = { ...groupOrderRef.current };
+      for (const u of updates) {
+        map[u.group] = u.entry;
+        if (u.entry.rev > groupOrderRevRef.current) {
+          groupOrderRevRef.current = u.entry.rev;
+        }
+      }
+      groupOrderRef.current = map;
+      setGroupOrderKeys(map);
+
+      // Stamp member rows + enqueue (immutable entries, content-deduped).
+      // Rows stamp the FINAL map entry: one call can carry several entries
+      // for a group (a move's phase-1 + phase-2) and the queue sends them
+      // all, but row state only ever holds the end state. Membership is by
+      // current row group, or an explicit `memberIds` override — the rename
+      // path, where the caller's row rewrite has not reached this hook's
+      // mirror yet, so group-name matching would find nothing.
+      const touched = new Set(updates.map((u) => u.group));
+      const stampFor = new Map<string, GroupOrderEntry>();
+      for (const u of updates) {
+        if (!u.memberIds) continue;
+        for (const id of u.memberIds) stampFor.set(id, map[u.group]!);
+      }
+      // Stamp via a FUNCTIONAL updater: a rename dispatches its row rewrite
+      // (group name change) in the same tick, so a value dispatch built from
+      // the ref snapshot would re-apply the pre-rename groups and silently
+      // undo the rename once React flushes the queue in order. The updater
+      // is pure (React may replay it); returning `prev` unchanged bails out
+      // of the re-render, and the render-time ref sync refreshes the mirror.
+      setMeasurementsRef.current((prev) => {
+        let changed = false;
+        const next = prev.map((m) => {
+          const target = stampFor.get(m.id) ?? (touched.has(m.group) ? map[m.group]! : undefined);
+          if (!target) return m;
+          if (
+            m.groupOrder &&
+            compareGroupOrderEntries(m.groupOrder, target) === 0
+          ) {
+            return m;
+          }
+          changed = true;
+          return { ...m, groupOrder: target };
+        });
+        return changed ? next : prev;
+      });
+      for (const u of updates) {
+        const memberIdSet = u.memberIds ? new Set(u.memberIds) : null;
+        for (const m of measurementsRef.current) {
+          if ((memberIdSet ? !memberIdSet.has(m.id) : m.group !== u.group) || m.suggested) continue;
+          // A row already carrying this exact entry has already had its write
+          // enqueued (triples only reach rows through this path or the server)
+          // — re-enqueueing would PATCH-spam on every convergence pass.
+          if (
+            m.groupOrder &&
+            compareGroupOrderEntries(m.groupOrder, u.entry) === 0 &&
+            m.groupOrder.key === u.entry.key
+          ) {
+            continue;
+          }
+          const dup = orderQueueRef.current.some(
+            (e) =>
+              e.id === m.id &&
+              e.field === 'group_order' &&
+              e.groupOrder != null &&
+              compareGroupOrderEntries(e.groupOrder, u.entry) === 0 &&
+              e.groupOrder.key === u.entry.key,
+          );
+          if (dup) continue;
+          orderQueueRef.current.push({
+            id: m.id,
+            field: 'group_order',
+            groupOrder: u.entry,
+            ...(u.withGroupName ? { group: u.group } : {}),
+          });
+          pendingOrderKeysRef.current.add(pendingToken('group_order', m.id));
+        }
+      }
+      void drainOrderQueue();
+    },
+    [drainOrderQueue],
+  );
+
+  /**
+   * Enqueue a per-ROW mirrored-triple write: the destination band's entry for
+   * a row that just crossed bands (or `null` to clear it when the destination
+   * band is keyless). Enqueue-only — the caller owns the row's local
+   * `groupOrder` field (it rewrites the row in the same state update as the
+   * group change). Without this, a row crossing bands keeps its OLD band's
+   * triple and the fold-back convergence adopts it for the destination band,
+   * silently reordering bands.
+   */
+  const persistRowGroupOrder = useCallback(
+    (updates: Array<{ id: string; entry: GroupOrderEntry | null }>) => {
+      if (updates.length === 0) return;
+      for (const u of updates) {
+        const dup = orderQueueRef.current.some(
+          (e) =>
+            e.id === u.id &&
+            e.field === 'group_order' &&
+            (u.entry === null
+              ? e.groupOrder === null
+              : e.groupOrder != null &&
+                compareGroupOrderEntries(e.groupOrder, u.entry) === 0 &&
+                e.groupOrder.key === u.entry.key),
+        );
+        if (dup) continue;
+        orderQueueRef.current.push({
+          id: u.id,
+          field: 'group_order',
+          groupOrder: u.entry,
+        });
+        pendingOrderKeysRef.current.add(pendingToken('group_order', u.id));
+      }
+      void drainOrderQueue();
+    },
+    [drainOrderQueue],
+  );
+
+  // Convergence effect (the #313 stamp/fold-back pattern, hook-side, with
+  // recency): FOLD-BACK first — adopt any row-observed triple that is newer
+  // than the map's (or fills an absent entry: restored delete-undo rows must
+  // re-teach the map; absence is ignorance, not authority). Then STAMP — any
+  // row lagging its group's map entry (a new row drawn into a keyed group, a
+  // restored row carrying an older triple) is updated and its write enqueued.
+  // Both halves are monotone (strictly-newer adoption; stamp-to-equal), so
+  // the effect converges in one extra pass and never oscillates.
+  useEffect(() => {
+    const map = { ...groupOrderRef.current };
+    let mapChanged = false;
+    for (const m of measurements) {
+      if (!m.groupOrder) continue;
+      if (shouldAdoptGroupOrder(map[m.group], m.groupOrder)) {
+        map[m.group] = m.groupOrder;
+        mapChanged = true;
+      }
+      if (m.groupOrder.rev > groupOrderRevRef.current) {
+        groupOrderRevRef.current = m.groupOrder.rev;
+      }
+    }
+    if (mapChanged) {
+      groupOrderRef.current = map;
+      setGroupOrderKeys(map);
+    }
+
+    const lagging = measurements.filter((m) => {
+      const entry = map[m.group];
+      if (!entry) return false; // map absence never clears a row's triple
+      return !m.groupOrder || compareGroupOrderEntries(m.groupOrder, entry) < 0;
+    });
+    if (lagging.length === 0) return;
+    const laggingGroups = [...new Set(lagging.map((m) => m.group))];
+    applyGroupOrder(laggingGroups.map((g) => ({ group: g, entry: map[g]! })));
+  }, [measurements, applyGroupOrder]);
 
   // Auto-save to localStorage with debounce (500ms). Keyed by the stable
   // project+document composite (issue #238), or a local-only key for an
@@ -1031,10 +1683,21 @@ export function useMeasurementPersistence({
       // been called by the time control returns.
       const deletePromise = applyPendingDeletes(current);
 
-      const toCreate = current
+      const toCreateRows = current
         // Suggested-but-unconfirmed measurements are excluded; accepting a
         // suggestion clears `suggested` and the next tick syncs it (#194).
-        .filter((m) => !m.serverId && !m.suggested)
+        .filter((m) => !m.serverId && !m.suggested);
+      // Capture each row's signature AS SENT: the response handler seeds the
+      // sync baseline from these, not from the by-then-current state, so a
+      // field edited while the create is in flight stays dirty and re-PATCHes
+      // instead of being silently baselined as already-synced.
+      const sentSigs = new Map(
+        toCreateRows.map((m) => [
+          m.id,
+          { sync: syncSignature(m), geom: geometrySignature(m) },
+        ]),
+      );
+      const toCreate = toCreateRows
         // Per-page scale: toApiFormat resolves each row's own page scale
         // from pageScales, so a multi-sheet set syncs correct ratios. The
         // document_id sent is the stable UUID, never the filename (#238).
@@ -1047,24 +1710,33 @@ export function useMeasurementPersistence({
       if (createPromise) {
         const created = await createPromise;
         // Update serverId on created measurements (map over the LATEST state).
-        setMeasurementsRef.current(
-          measurementsRef.current.map((m) => {
-            if (m.serverId) return m;
-            const match = created.find(
-              (c) => (c.metadata?.frontend_id as string) === m.id,
-            );
-            if (!match) return m;
-            // Seed the sync baseline for the freshly-synced row so a later
-            // edit PATCHes, but a no-op tick does not (#194/#282). Seed the
-            // geometry baseline too (#334) so the first appearance-only edit
-            // after a create does not re-stamp the page scale.
-            syncSigRef.current.set(match.id, syncSignature(m));
-            geomSigRef.current.set(match.id, geometrySignature(m));
-            return { ...m, serverId: match.id };
-          }),
-        );
+        const stamped = measurementsRef.current.map((m) => {
+          if (m.serverId) return m;
+          const match = created.find(
+            (c) => (c.metadata?.frontend_id as string) === m.id,
+          );
+          if (!match) return m;
+          // Seed the sync baseline for the freshly-synced row so a later
+          // edit PATCHes, but a no-op tick does not (#194/#282). Seed the
+          // geometry baseline too (#334) so the first appearance-only edit
+          // after a create does not re-stamp the page scale. Both seed from
+          // the SENT snapshot, not this (latest) row: anything edited while
+          // the create was in flight must still read as dirty.
+          const sent = sentSigs.get(m.id);
+          syncSigRef.current.set(match.id, sent?.sync ?? syncSignature(m));
+          geomSigRef.current.set(match.id, sent?.geom ?? geometrySignature(m));
+          return { ...m, serverId: match.id };
+        });
+        // Eager mirror-ref sync (same reason as the load path): the drain
+        // below resolves serverIds through the ref, and a render has not
+        // happened yet — a stale mirror would strand retained group-order
+        // writes until some unrelated later sync.
+        measurementsRef.current = stamped;
+        setMeasurementsRef.current(stamped);
         // Surface the new measurements in the unified Markups hub.
         qc?.invalidateQueries({ queryKey: ['unified-markups'] });
+        // Rows that just gained serverIds may have order writes waiting.
+        void drainOrderQueue();
       }
       setSyncedToServer(true);
     } catch {
@@ -1072,7 +1744,7 @@ export function useMeasurementPersistence({
     } finally {
       setSyncing(false);
     }
-  }, [applyPendingDeletes, qc]);
+  }, [applyPendingDeletes, qc, drainOrderQueue]);
 
   // Auto-sync to server with debounce (3s). Both measurement and annotation
   // types persist now (v2.6.7) — backend schema accepts the full set.
@@ -1114,9 +1786,15 @@ export function useMeasurementPersistence({
     if (!canSync) return;
     if (measurements.length === 0) return;
 
-    // Find synced rows whose sync-signature drifted from the server baseline.
-    const dirty = measurements.filter((m) => {
+    // Dirty check: a synced row whose sync-signature drifted from the server
+    // baseline. Rows with a QUEUED order-key write are excluded — their key
+    // write belongs to the sequential order flush, and PATCHing them here
+    // (with the final key, concurrently) could land a non-prefix key subset
+    // that reorders the document for other clients mid-flush. The drain
+    // re-triggers this effect when it finishes.
+    const isDirty = (m: Measurement): boolean => {
       if (!m.serverId || m.suggested) return false;
+      if (pendingOrderKeysRef.current.has(pendingToken('order', m.id))) return false;
       const prevSig = syncSigRef.current.get(m.serverId);
       // No baseline yet (e.g. a row hydrated before its baseline seeded)
       // -> record the current signature without firing a PATCH.
@@ -1126,13 +1804,20 @@ export function useMeasurementPersistence({
         return false;
       }
       return prevSig !== syncSignature(m);
-    });
-    if (dirty.length === 0) return;
+    };
+    if (!measurements.some(isDirty)) return;
 
     if (patchTimerRef.current) clearTimeout(patchTimerRef.current);
     patchTimerRef.current = setTimeout(async () => {
       // The debounce has fired: no longer pending (issue #336 unsaved-changes).
       patchTimerRef.current = null;
+      // Re-derive the dirty set AT FIRE TIME from the latest state: the list
+      // captured when the effect scheduled can be stale by now (rows edited
+      // again, keys acked by the order flush, rows newly queued), and firing
+      // a stale snapshot both double-sends and races the order flush.
+      const dirty = measurementsRef.current.filter(isDirty);
+      if (dirty.length === 0) return;
+      const pageScalesNow = pageScalesRef.current;
       const reconciled: { frontendId: string; value: number; area?: number }[] = [];
       await Promise.all(
         dirty.map(async (m) => {
@@ -1154,8 +1839,8 @@ export function useMeasurementPersistence({
               serverId,
               toApiUpdate(
                 m,
-                scaleForPage(pageScales, m.page),
-                pageIsCalibrated(pageScales, m.page),
+                scaleForPage(pageScalesNow, m.page),
+                pageIsCalibrated(pageScalesNow, m.page),
                 geometryChanged,
               ),
             );
@@ -1264,7 +1949,10 @@ export function useMeasurementPersistence({
       patchTimerRef.current !== null ||
       pageScalesPutTimerRef.current !== null ||
       inFlightPatchRef.current.size > 0 ||
-      pendingDeletesRef.current.size > 0,
+      pendingDeletesRef.current.size > 0 ||
+      // Order-key writes not yet acked by the server (issue #336 family:
+      // every pending-work tracker ORs into the unsaved-changes guard).
+      orderQueueRef.current.length > 0,
     [],
   );
 
@@ -1326,5 +2014,11 @@ export function useMeasurementPersistence({
     syncedToServer,
     registerDeletion,
     hasUnsavedChanges,
+    persistOrderKeys,
+    groupOrderKeys,
+    applyGroupOrder,
+    persistRowGroupOrder,
+    mintGroupOrderRev,
+    groupOrderActor,
   };
 }

@@ -397,7 +397,7 @@ type UndoOperation =
   | { kind: 'complete_measurement'; measurement: Measurement; previousActivePoints: Point[] }
   | { kind: 'add_count_point'; measurementId: string; point: Point; wasNew: boolean; previousMeasurement: Measurement | null }
   | { kind: 'delete_measurement'; measurement: Measurement }
-  | { kind: 'change_annotation'; measurementId: string; previousAnnotation: string }
+  | { kind: 'change_annotation'; measurementId: string; previousAnnotation: string; nextAnnotation: string }
   // In-canvas geometry edit (#194 Feature 1). Both kinds snapshot the
   // pre-edit measurement so undo restores the exact prior geometry +
   // derived value; redo replays the post-edit snapshot.
@@ -2312,12 +2312,20 @@ export default function TakeoffViewerModule({
   /** Update the annotation of a measurement with undo support. */
   const updateAnnotation = useCallback(
     (id: string, newAnnotation: string) => {
+      // Record BOTH sides of the edit at edit time so undo/redo never has to
+      // capture the pre-edit text inside a setMeasurements updater (whose
+      // evaluation timing React does not guarantee). Read the previous text from
+      // the render-synced ref, push the two-sided op, then dispatch a pure map.
+      const previousAnnotation =
+        measurementsRef.current.find((m) => m.id === id)?.annotation ?? '';
+      pushUndo({
+        kind: 'change_annotation',
+        measurementId: id,
+        previousAnnotation,
+        nextAnnotation: newAnnotation,
+      });
       setMeasurements((prev) =>
-        prev.map((m) => {
-          if (m.id !== id) return m;
-          pushUndo({ kind: 'change_annotation', measurementId: id, previousAnnotation: m.annotation });
-          return { ...m, annotation: newAnnotation };
-        }),
+        prev.map((m) => (m.id === id ? { ...m, annotation: newAnnotation } : m)),
       );
     },
     [pushUndo],
@@ -5620,12 +5628,6 @@ export default function TakeoffViewerModule({
     const op = stack.pop()!;
     setUndoCount(stack.length);
 
-    // Push onto the redo stack BEFORE applying the reversal, so that
-    // Redo can re-issue the operation.  For `change_annotation` we
-    // capture the CURRENT (pre-revert) annotation text below so redo
-    // can swap it back.
-    let forwardOp: UndoOperation = op;
-
     switch (op.kind) {
       case 'add_point':
         // Remove the last point from the in-progress measurement
@@ -5668,24 +5670,16 @@ export default function TakeoffViewerModule({
         setMeasurements((prev) => [...prev, op.measurement]);
         break;
 
-      case 'change_annotation': {
-        // Grab the current (about-to-be-overwritten) annotation so redo
-        // can replay the forward delta by swapping again.
-        setMeasurements((prev) => {
-          const target = prev.find((m) => m.id === op.measurementId);
-          if (target) {
-            forwardOp = {
-              kind: 'change_annotation',
-              measurementId: op.measurementId,
-              previousAnnotation: target.annotation,
-            };
-          }
-          return prev.map((m) =>
+      case 'change_annotation':
+        // The op carries both sides (recorded at edit time), so undo restores
+        // the previous text with a pure map. Nothing is captured inside the
+        // updater; the op is re-pushed to redo unchanged below.
+        setMeasurements((prev) =>
+          prev.map((m) =>
             m.id === op.measurementId ? { ...m, annotation: op.previousAnnotation } : m,
-          );
-        });
+          ),
+        );
         break;
-      }
 
       case 'edit_geometry':
         // Restore the pre-edit measurement (geometry + derived value/label).
@@ -5701,8 +5695,8 @@ export default function TakeoffViewerModule({
         break;
     }
 
-    // Push the (possibly-adjusted) forward op onto redo.
-    redoStackRef.current.push(forwardOp);
+    // Every op is self-contained, so re-push it onto redo unchanged.
+    redoStackRef.current.push(op);
     setRedoCount(redoStackRef.current.length);
 
     addToast({ type: 'info', title: t('takeoff.undo', { defaultValue: 'Undo' }), message: t('takeoff.measurement_undone', { defaultValue: 'Measurement undone' }) });
@@ -5714,8 +5708,6 @@ export default function TakeoffViewerModule({
     if (stack.length === 0) return;
     const op = stack.pop()!;
     setRedoCount(stack.length);
-
-    let reverseOp: UndoOperation = op;
 
     switch (op.kind) {
       case 'add_point':
@@ -5771,24 +5763,15 @@ export default function TakeoffViewerModule({
         setSelectedMeasurementId((sel) => (sel === op.measurement.id ? null : sel));
         break;
 
-      case 'change_annotation': {
-        // Swap annotations again — capture the current value so a
-        // subsequent undo can revert this redo.
-        setMeasurements((prev) => {
-          const target = prev.find((m) => m.id === op.measurementId);
-          if (target) {
-            reverseOp = {
-              kind: 'change_annotation',
-              measurementId: op.measurementId,
-              previousAnnotation: target.annotation,
-            };
-          }
-          return prev.map((m) =>
-            m.id === op.measurementId ? { ...m, annotation: op.previousAnnotation } : m,
-          );
-        });
+      case 'change_annotation':
+        // Redo restores the NEXT text (the forward side of the recorded op)
+        // with a pure map; the op is re-pushed to undo unchanged below.
+        setMeasurements((prev) =>
+          prev.map((m) =>
+            m.id === op.measurementId ? { ...m, annotation: op.nextAnnotation } : m,
+          ),
+        );
         break;
-      }
 
       case 'edit_geometry':
         // Re-apply the post-edit measurement.
@@ -5802,8 +5785,8 @@ export default function TakeoffViewerModule({
         break;
     }
 
-    // Push the reverse op onto undo so Ctrl+Z works again.
-    undoStackRef.current.push(reverseOp);
+    // Push the op back onto undo so Ctrl+Z works again.
+    undoStackRef.current.push(op);
     setUndoCount(undoStackRef.current.length);
 
     addToast({

@@ -111,6 +111,7 @@ import {
   minVertices,
   type HitResult,
 } from './data/hit-test';
+import { clampPage } from './data/page-deeplink';
 import {
   SHORTCUT_LETTER,
   labelWithShortcut,
@@ -430,6 +431,10 @@ interface TakeoffViewerModuleProps {
    *  list lands (used by the /markups → /takeoff deep-link). Matches either
    *  the frontend id or the server-side UUID. */
   initialMeasurementId?: string | null;
+  /** Optional 1-based page to restore when a server document is reopened. */
+  initialPage?: number | null;
+  /** Notify the host when the visible page changes. */
+  onPageChange?: (page: number) => void;
   /** Previously-uploaded documents for the active project, shown on the
    *  landing page as a "Recent drawings" quick-open list. */
   recentDocuments?: RecentTakeoffDocument[];
@@ -447,6 +452,8 @@ export default function TakeoffViewerModule({
   initialPdfName,
   initialDocumentId,
   initialMeasurementId,
+  initialPage,
+  onPageChange,
   recentDocuments,
   onOpenRecentDocument,
 }: TakeoffViewerModuleProps = {}) {
@@ -958,6 +965,13 @@ export default function TakeoffViewerModule({
    * Guarded by a ref so we only consume the param once per mount — the
    * user is free to click around afterwards without us yanking them back. */
   const deepLinkConsumedRef = useRef<string | null>(null);
+  /** Consume the URL `page` restore only once per mounted viewer instance: after
+   *  the first load applies it, later loads within the same instance reset to
+   *  page 1 so the user is not yanked back after navigating (mirrors
+   *  deepLinkConsumedRef above). Cross-document scoping is handled upstream by
+   *  resolveInitialPage in TakeoffPage; the viewer remounts per document via its
+   *  key, so this ref does not guard the document switch itself. */
+  const initialPageConsumedRef = useRef(false);
   useEffect(() => {
     if (!initialMeasurementId) return;
     if (deepLinkConsumedRef.current === initialMeasurementId) return;
@@ -984,6 +998,7 @@ export default function TakeoffViewerModule({
       const doc = await pdfjsLib.getDocument({ data: arrayBuffer }).promise;
       setPdfDoc(doc);
       setTotalPages(doc.numPages);
+      initialPageConsumedRef.current = true;
       setCurrentPage(1);
       setFileName(file.name); // Triggers persistence hook to load saved measurements
       // A freshly dropped local file has no server document UUID yet (issue
@@ -1042,6 +1057,15 @@ export default function TakeoffViewerModule({
     setDragPreview(null);
   }, [currentPage]);
 
+  useEffect(() => {
+    // Only mirror the page into the URL once a document is loaded, so the
+    // mount-time default (page 1) does not transiently clear a deep-linked
+    // `page` param before the restore below runs.
+    if (!pdfDoc) return;
+    onPageChange?.(currentPage);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [currentPage, pdfDoc]);
+
   /* Deselect a measurement that lives on a different page than the one
    * being viewed — keeps Properties panel coherent with the canvas. */
   useEffect(() => {
@@ -1081,7 +1105,11 @@ export default function TakeoffViewerModule({
         if (cancelled) return;
         setPdfDoc(doc);
         setTotalPages(doc.numPages);
-        setCurrentPage(1);
+        const restoredPage = initialPageConsumedRef.current
+          ? 1
+          : clampPage(initialPage ?? 1, doc.numPages);
+        initialPageConsumedRef.current = true;
+        setCurrentPage(restoredPage);
         setFileName(initialPdfName || 'Document.pdf');
         setActivePoints([]);
         undoStackRef.current = [];

@@ -44,6 +44,11 @@ import { takeoffApi, type TakeoffDocumentResponse } from './api';
 import { canonicalizeUnit } from './lib/units';
 import { aiApi } from '@/features/ai/api';
 import { hasLlmKey } from '@/features/ai-estimator/useAiReadiness';
+import {
+  parsePageParam,
+  resolveInitialPage,
+  pageParamForUrl,
+} from '@/modules/pdf-takeoff/data/page-deeplink';
 
 const TakeoffViewerModule = lazy(() => import('@/modules/pdf-takeoff/TakeoffViewerModule'));
 
@@ -1221,6 +1226,14 @@ export function TakeoffPage() {
   const [initialMeasurementId, setInitialMeasurementId] = useState<string | null>(
     () => searchParams.get('measurementId'),
   );
+  const [initialPage] = useState<number | undefined>(() =>
+    parsePageParam(searchParams.get('page')),
+  );
+  // Scope the page deep-link to the document named in the same URL. The viewer
+  // remounts on a filmstrip document switch (key={viewerDoc?.id} below) but this
+  // page does not, so an unscoped initialPage would re-apply the deep-linked page
+  // to the next document opened.
+  const [initialPageDocId] = useState<string | null>(() => searchParams.get('doc'));
 
   /** True when a `?docId=` deep-link couldn't be resolved against either
    *  the takeoff documents catalogue or the project documents module —
@@ -2383,6 +2396,16 @@ export function TakeoffPage() {
                   initialPdfName={viewerDoc?.name}
                   initialDocumentId={viewerDoc?.id}
                   initialMeasurementId={initialMeasurementId}
+                  initialPage={resolveInitialPage(viewerDoc?.id, initialPageDocId, initialPage)}
+                  onPageChange={(page) => {
+                    setSearchParams((prev) => {
+                      const next = new URLSearchParams(prev);
+                      const param = pageParamForUrl(page);
+                      if (param !== null) next.set('page', param);
+                      else next.delete('page');
+                      return next;
+                    }, { replace: true });
+                  }}
                   recentDocuments={serverDocuments}
                   onOpenRecentDocument={handleOpenDocInViewer}
                 />

@@ -1,6 +1,6 @@
 // DDC-CWICR-OE: DataDrivenConstruction · OpenConstructionERP
 // Copyright (c) 2026 Artem Boiko / DataDrivenConstruction
-import { useCallback, useContext, useEffect, useRef, useState } from 'react';
+import { useCallback, useContext, useEffect, useRef, useState, type Dispatch, type SetStateAction } from 'react';
 import { QueryClientContext } from '@tanstack/react-query';
 import { takeoffApi, type MeasurementCreate, type MeasurementResponse } from '@/features/takeoff/api';
 import {
@@ -631,7 +631,11 @@ interface UseMeasurementPersistenceOptions {
    *  and do NOT sync to the server. */
   documentId: string | null;
   measurements: Measurement[];
-  setMeasurements: (measurements: Measurement[]) => void;
+  // Accepts a functional updater (not just a plain value) so the post-await
+  // write-backs can compose with whatever is in state when React applies them.
+  // The caller already passes React's ``useState`` setter, so this only widens
+  // the declared type to what is passed at runtime.
+  setMeasurements: Dispatch<SetStateAction<Measurement[]>>;
   /** Per-page (per-sheet) scale model. Persisted whole; a legacy
    *  single-scale document is migrated into the default on load. */
   pageScales: PageScales;
@@ -1046,21 +1050,31 @@ export function useMeasurementPersistence({
 
       if (createPromise) {
         const created = await createPromise;
-        // Update serverId on created measurements (map over the LATEST state).
-        setMeasurementsRef.current(
-          measurementsRef.current.map((m) => {
+        const byFrontendId = new Map(
+          created.map((c) => [c.metadata?.frontend_id as string, c]),
+        );
+        // Seed the sync + geometry baselines (#194/#282/#334) from ``current`` -
+        // the pre-await snapshot the create payload was built from - NOT the
+        // post-await ref. A row edited while the create was in flight must be
+        // baselined in its AS-SENT form, or the dirty check treats the unsent
+        // edit as already-synced and never PATCHes it. These are side effects,
+        // so they run here, outside the pure updater below (StrictMode replays it).
+        for (const m of current) {
+          if (m.serverId) continue;
+          const match = byFrontendId.get(m.id);
+          if (!match) continue;
+          syncSigRef.current.set(match.id, syncSignature(m));
+          geomSigRef.current.set(match.id, geometrySignature(m));
+        }
+        // Stamp serverIds with a functional updater so a measurement drawn while
+        // the create was in flight (a queued, not-yet-rendered update) survives,
+        // instead of being clobbered by a plain-value dispatch built from the
+        // last-rendered ``measurementsRef`` snapshot.
+        setMeasurementsRef.current((prev) =>
+          prev.map((m) => {
             if (m.serverId) return m;
-            const match = created.find(
-              (c) => (c.metadata?.frontend_id as string) === m.id,
-            );
-            if (!match) return m;
-            // Seed the sync baseline for the freshly-synced row so a later
-            // edit PATCHes, but a no-op tick does not (#194/#282). Seed the
-            // geometry baseline too (#334) so the first appearance-only edit
-            // after a create does not re-stamp the page scale.
-            syncSigRef.current.set(match.id, syncSignature(m));
-            geomSigRef.current.set(match.id, geometrySignature(m));
-            return { ...m, serverId: match.id };
+            const match = byFrontendId.get(m.id);
+            return match ? { ...m, serverId: match.id } : m;
           }),
         );
         // Surface the new measurements in the unified Markups hub.
@@ -1133,7 +1147,7 @@ export function useMeasurementPersistence({
     patchTimerRef.current = setTimeout(async () => {
       // The debounce has fired: no longer pending (issue #336 unsaved-changes).
       patchTimerRef.current = null;
-      const reconciled: { frontendId: string; value: number; area?: number }[] = [];
+      const reconciled: { frontendId: string; value: number; area?: number; sig: string }[] = [];
       await Promise.all(
         dirty.map(async (m) => {
           const serverId = m.serverId!;
@@ -1171,6 +1185,10 @@ export function useMeasurementPersistence({
               frontendId: m.id,
               value: serverValue,
               area: (updated.metadata?.area as number) ?? updated.measurement_value ?? undefined,
+              // The submitted signature (computed above): the server value
+              // corresponds to THIS geometry, so only apply it if the row still
+              // matches it when the write-back lands.
+              sig,
             });
           } catch {
             // PATCH failed - keep the optimistic value + the localStorage
@@ -1183,10 +1201,16 @@ export function useMeasurementPersistence({
       );
 
       if (reconciled.length > 0) {
-        setMeasurementsRef.current(
-          measurementsRef.current.map((m) => {
+        // Functional updater (not a plain-value dispatch from the last-rendered
+        // ``measurementsRef``) so an edit made while the PATCH was in flight is
+        // not clobbered. Apply the server-recomputed quantity only to a row
+        // whose signature still matches what we submitted: a row reshaped
+        // mid-PATCH keeps its optimistic value and is re-PATCHed by the dirty
+        // check, instead of pairing new points with an old server value.
+        setMeasurementsRef.current((prev) =>
+          prev.map((m) => {
             const r = reconciled.find((x) => x.frontendId === m.id);
-            if (!r) return m;
+            if (!r || syncSignature(m) !== r.sig) return m;
             return {
               ...m,
               value: r.value,

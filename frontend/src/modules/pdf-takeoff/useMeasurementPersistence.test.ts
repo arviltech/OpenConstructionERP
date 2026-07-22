@@ -1011,4 +1011,71 @@ describe('useMeasurementPersistence', () => {
 
     vi.useRealTimers();
   });
+
+  /* ── Stale-snapshot dispatch: a background sync must not revert a concurrent
+   *    edit/draw. The post-await write-backs used to dispatch a plain-value
+   *    array built from the last-rendered ``measurementsRef``; a functional
+   *    update queued but not yet rendered when that value dispatch ran was
+   *    applied first and then discarded. Both write-backs are now functional
+   *    updaters that compose with whatever is in state when React applies them. ── */
+
+  // A measurement drawn while the create-sync's bulkCreate is in flight must
+  // survive the serverId stamp, instead of being clobbered by a value dispatch
+  // built from the pre-draw snapshot.
+  it('keeps a measurement drawn while the create-sync is in flight (stale-snapshot dispatch)', async () => {
+    const { takeoffApi } = await import('@/features/takeoff/api');
+    // A bulkCreate we resolve on demand, so a concurrent draw can be injected
+    // into state while the create is in flight.
+    let resolveCreate: ((rows: unknown[]) => void) | null = null;
+    (takeoffApi.bulkCreate as unknown as ReturnType<typeof vi.fn>).mockImplementationOnce(
+      () => new Promise((res) => { resolveCreate = res as (rows: unknown[]) => void; }),
+    );
+
+    const m1 = makeMeasurement('m1');
+    const m2 = makeMeasurement('m2'); // drawn while the create is in flight
+    // A setter that applies functional updaters like React's real setState and
+    // records a plain-value dispatch verbatim - so a stale value dispatch
+    // overwrites the concurrent draw exactly as it would in the app.
+    let liveState: TestMeasurement[] = [m1];
+
+    const { result } = renderHook(() =>
+      useMeasurementPersistence({
+        fileName: 'race.pdf',
+        documentId: DOC,
+        measurements: [m1],
+        setMeasurements: (upd) => {
+          liveState =
+            typeof upd === 'function'
+              ? (upd as (p: TestMeasurement[]) => TestMeasurement[])(liveState)
+              : (upd as TestMeasurement[]);
+        },
+        pageScales: basePageScales,
+        setPageScales: vi.fn(),
+        scale: defaultScale,
+        projectId: PROJECT,
+      }),
+    );
+
+    // Fire the create immediately (saveNow bypasses the 3s debounce) and let it
+    // reach the ``await bulkCreate`` suspension.
+    await act(async () => {
+      result.current.saveNow();
+      await Promise.resolve();
+    });
+
+    // The viewer draws m2 while the create is in flight: a functional update to
+    // the same state the hook is about to stamp.
+    liveState = [m1, m2];
+
+    // The server confirms the create for m1.
+    await act(async () => {
+      resolveCreate?.([{ id: 'srv-1', metadata: { frontend_id: 'm1' } }]);
+      await Promise.resolve();
+      await Promise.resolve();
+    });
+
+    // m1 got its serverId AND the concurrently-drawn m2 survived the stamp.
+    expect(liveState.find((m) => m.id === 'm1')?.serverId).toBe('srv-1');
+    expect(liveState.map((m) => m.id)).toContain('m2');
+  });
 });

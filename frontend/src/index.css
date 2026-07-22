@@ -541,6 +541,23 @@ h4 {
   --ag-range-selection-background-color: rgba(59, 130, 246, 0.1);
 }
 
+/* The BOQ grid renders with ag-theme-quartz, so the alpine dark overrides above
+   never reach it. Without these vars the grid keeps Quartz's default light
+   palette in dark mode; mirror the alpine dark mapping so the grid follows the
+   app theme. */
+.dark .ag-theme-quartz {
+  --ag-background-color: var(--oe-bg);
+  --ag-header-background-color: var(--oe-bg-tertiary);
+  --ag-header-foreground-color: var(--oe-text-secondary);
+  --ag-foreground-color: var(--oe-text-primary);
+  --ag-border-color: var(--oe-border-light);
+  --ag-row-border-color: var(--oe-border-light);
+  --ag-secondary-foreground-color: var(--oe-text-secondary);
+  --ag-selected-row-background-color: var(--oe-blue-subtle);
+  --ag-odd-row-background-color: var(--oe-bg-secondary);
+  --ag-range-selection-background-color: rgba(59, 130, 246, 0.1);
+}
+
 /* ── BOQ header density — shrink header text when many columns ─────────
    Three tiers based on column count (computed in BOQGrid.tsx and applied
    as a className alongside `ag-theme-quartz`):

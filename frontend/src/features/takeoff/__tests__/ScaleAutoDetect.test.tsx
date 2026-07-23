@@ -2,13 +2,20 @@
 // Copyright (c) 2026 Artem Boiko / DataDrivenConstruction
 /**
  * Tests for the self-contained scale auto-detect widget:
- *   1. While the detect request is in flight it shows a "checking" line.
+ *   1. While the detect request is in flight it renders nothing.
  *   2. When a scale is found it shows "Detected scale: 1:100" + evidence and a
  *      "Use this" button that calls onApply with the canonical preset scale.
  *   3. A candidate on the current page is preferred over the document-wide best.
- *   4. A null best -> "no scale detected" (quiet, never blocks the host).
- *   5. A fetch error -> "no scale detected" and never throws.
- *   6. A disabled module (null response) -> "no scale detected".
+ *   4. A null best -> renders nothing (quiet; never blocks the host).
+ *   5. A fetch error -> renders nothing and never throws.
+ *   6. A disabled module (null response) -> renders nothing.
+ *   7. An invalid detected ratio is refused (never applied).
+ *
+ * The widget only ever produces output in the actionable "found" state; every
+ * idle state (in flight, no scale note, failed, disabled) renders null so it
+ * occupies no space on an uncalibrated page. The host mounts it only while the
+ * page is uncalibrated, so a found suggestion also disappears once a scale is
+ * set - that gate lives in the viewer and is covered by live smoke, not here.
  */
 
 // @ts-nocheck
@@ -32,10 +39,13 @@ function candidate(over = {}) {
 }
 
 describe('ScaleAutoDetect', () => {
-  it('shows a checking state while detection is in flight', () => {
+  it('renders nothing while detection is in flight', () => {
     vi.spyOn(takeoffApi, 'detectScale').mockReturnValue(new Promise(() => {}));
-    render(<ScaleAutoDetect documentId="doc-1" pageNumber={1} onApply={vi.fn()} />);
-    expect(screen.getByTestId('scale-autodetect-loading')).toBeTruthy();
+    const { container } = render(
+      <ScaleAutoDetect documentId="doc-1" pageNumber={1} onApply={vi.fn()} />,
+    );
+    expect(container.firstChild).toBeNull();
+    expect(screen.queryByTestId('scale-autodetect-found')).toBeNull();
   });
 
   it('shows the detected scale and applies the canonical preset on click', async () => {
@@ -78,27 +88,31 @@ describe('ScaleAutoDetect', () => {
     expect(scale.pixelsPerUnit).toBeCloseTo(presetScale(20).pixelsPerUnit, 6);
   });
 
-  it('shows the quiet none state when no scale is detected', async () => {
-    vi.spyOn(takeoffApi, 'detectScale').mockResolvedValue({
+  it('renders nothing when no scale is detected', async () => {
+    const detect = vi.spyOn(takeoffApi, 'detectScale').mockResolvedValue({
       best: null,
       candidates: [],
       source: 'text_layer',
     });
-    render(<ScaleAutoDetect documentId="doc-1" onApply={vi.fn()} />);
-    await screen.findByTestId('scale-autodetect-none');
+    const { container } = render(<ScaleAutoDetect documentId="doc-1" onApply={vi.fn()} />);
+    await waitFor(() => expect(detect).toHaveBeenCalled());
+    expect(screen.queryByTestId('scale-autodetect-found')).toBeNull();
+    expect(container.firstChild).toBeNull();
+  });
+
+  it('renders nothing (no throw) when detection fails', async () => {
+    const detect = vi.spyOn(takeoffApi, 'detectScale').mockRejectedValue(new Error('network'));
+    const { container } = render(<ScaleAutoDetect documentId="doc-1" onApply={vi.fn()} />);
+    await waitFor(() => expect(detect).toHaveBeenCalled());
+    expect(container.firstChild).toBeNull();
     expect(screen.queryByTestId('scale-autodetect-found')).toBeNull();
   });
 
-  it('degrades to the none state (no throw) when detection fails', async () => {
-    vi.spyOn(takeoffApi, 'detectScale').mockRejectedValue(new Error('network'));
-    render(<ScaleAutoDetect documentId="doc-1" onApply={vi.fn()} />);
-    await waitFor(() => expect(screen.getByTestId('scale-autodetect-none')).toBeTruthy());
-  });
-
-  it('shows the none state when the module is disabled (null response)', async () => {
-    vi.spyOn(takeoffApi, 'detectScale').mockResolvedValue(null);
-    render(<ScaleAutoDetect documentId="doc-1" onApply={vi.fn()} />);
-    await screen.findByTestId('scale-autodetect-none');
+  it('renders nothing when the module is disabled (null response)', async () => {
+    const detect = vi.spyOn(takeoffApi, 'detectScale').mockResolvedValue(null);
+    const { container } = render(<ScaleAutoDetect documentId="doc-1" onApply={vi.fn()} />);
+    await waitFor(() => expect(detect).toHaveBeenCalled());
+    expect(container.firstChild).toBeNull();
   });
 
   it('does not call onApply for an invalid detected ratio', async () => {

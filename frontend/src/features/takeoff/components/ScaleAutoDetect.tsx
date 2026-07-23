@@ -49,12 +49,15 @@ type DetectState =
  * Renders a compact scale-detection affordance for one document/page.
  *
  * Behaviour:
- *  - while the detect request is in flight: a quiet "checking..." line;
  *  - when a scale is found: "Detected scale: 1:100" + the matched evidence +
  *    a "Use this" button;
- *  - when nothing is found (or the request fails / the module is disabled): a
- *    subtle "No scale note detected" line so the affordance never blocks the
- *    manual calibration the host already provides.
+ *  - every other state (in flight, nothing found, request failed, module
+ *    disabled): renders nothing. Only an actionable suggestion is worth space
+ *    above the drawing; the host already provides manual Scale/Calibrate
+ *    controls, so an idle "checking..." or "no scale note" line would just add
+ *    clutter on every uncalibrated page. The host mounts this only on an
+ *    uncalibrated page, so a found suggestion also disappears once the page has
+ *    a scale.
  */
 export function ScaleAutoDetect({
   documentId,
@@ -97,30 +100,12 @@ export function ScaleAutoDetect({
     };
   }, [documentId, pageNumber]);
 
-  if (state.status === 'loading') {
-    return (
-      <p
-        className={`text-[10px] text-content-tertiary ${className ?? ''}`}
-        data-testid="scale-autodetect-loading"
-      >
-        {t('takeoff.detect_scale_checking', {
-          defaultValue: 'Checking the drawing for a scale note...',
-        })}
-      </p>
-    );
-  }
-
-  if (state.status === 'none') {
-    return (
-      <p
-        className={`text-[10px] text-content-quaternary ${className ?? ''}`}
-        data-testid="scale-autodetect-none"
-      >
-        {t('takeoff.detect_scale_none', {
-          defaultValue: 'No scale note detected on the drawing',
-        })}
-      </p>
-    );
+  if (state.status !== 'found') {
+    // Render nothing unless there is an actionable suggestion. The in-flight and
+    // empty states add no value on a strip of their own - the host already
+    // provides manual Scale/Calibrate controls, so a standalone line only wastes
+    // vertical space above the drawing on every uncalibrated page.
+    return null;
   }
 
   const { candidate } = state;

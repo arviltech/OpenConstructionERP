@@ -7012,9 +7012,13 @@ export default function TakeoffViewerModule({
                 directly below the toolbar so the two toolbar rows stay clean.
                 Only for server-side documents (it needs a document id to scan)
                 and hidden while actively setting or calibrating scale so it
-                never competes with those flows. Nothing auto-applies - the
-                user confirms via "Use this" (CLAUDE.md rule 7). */}
-            {documentId && !calibrationMode && !settingScale && (
+                never competes with those flows. Also hidden once the page IS
+                calibrated: the suggestion only helps an uncalibrated sheet, and
+                calibration state is already persisted per page, so applying it
+                (or any manual calibration) makes it disappear and stay gone on
+                reopen with no dismissal state of its own. Nothing auto-applies -
+                the user confirms via "Use this" (CLAUDE.md rule 7). */}
+            {documentId && !calibrationMode && !settingScale && !isCalibrated && (
               <ScaleAutoDetect
                 documentId={documentId}
                 pageNumber={currentPage}

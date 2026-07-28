@@ -12,7 +12,9 @@ import {
   hydrateGroupBands,
   stampGroupBands,
   groupBandCommit,
+  isRenormalisedDrop,
 } from '../lib/takeoff-order';
+import type { RenormalisedDrop } from '../lib/takeoff-order';
 
 /** Minimal orderable rows for the projection tests. */
 const row = (id: string, order?: number) => ({ id, order });
@@ -95,8 +97,10 @@ describe('orderKeyForDrop (issue #379 drag reorder)', () => {
     const rows = [row('a'), row('b'), row('c'), row('d')];
     const key = orderKeyForDrop(rows, 'd', 'b', 'before');
     expect(key).not.toBeNull();
+    // These fixtures have room between every pair of keys, so the drop is always
+    // a plain key and never the whole-group renumbering.
     const sorted = sortByPaintOrder(
-      rows.map((r) => (r.id === 'd' ? { ...r, order: key! } : r)),
+      rows.map((r) => (r.id === 'd' ? { ...r, order: key as number } : r)),
     ).map((r) => r.id);
     expect(sorted).toEqual(['a', 'd', 'b', 'c']);
   });
@@ -105,7 +109,7 @@ describe('orderKeyForDrop (issue #379 drag reorder)', () => {
     const rows = [row('a'), row('b'), row('c'), row('d')];
     const key = orderKeyForDrop(rows, 'a', 'c', 'after');
     const sorted = sortByPaintOrder(
-      rows.map((r) => (r.id === 'a' ? { ...r, order: key! } : r)),
+      rows.map((r) => (r.id === 'a' ? { ...r, order: key as number } : r)),
     ).map((r) => r.id);
     expect(sorted).toEqual(['b', 'c', 'a', 'd']);
   });
@@ -114,7 +118,7 @@ describe('orderKeyForDrop (issue #379 drag reorder)', () => {
     const rows = [row('a'), row('b'), row('c')];
     const key = orderKeyForDrop(rows, 'a', 'c', 'after');
     const sorted = sortByPaintOrder(
-      rows.map((r) => (r.id === 'a' ? { ...r, order: key! } : r)),
+      rows.map((r) => (r.id === 'a' ? { ...r, order: key as number } : r)),
     ).map((r) => r.id);
     expect(sorted).toEqual(['b', 'c', 'a']);
   });
@@ -154,7 +158,7 @@ describe('orderKeyForDrop (issue #379 drag reorder)', () => {
     const rows = [row('a'), row('b'), row('c')];
     const key = orderKeyForDrop(rows, 'a', 'c', 'after');
     const sorted = sortByPaintOrder(
-      rows.map((r) => (r.id === 'a' ? { ...r, order: key! } : r)),
+      rows.map((r) => (r.id === 'a' ? { ...r, order: key as number } : r)),
     ).map((r) => r.id);
     expect(sorted).toEqual(['b', 'c', 'a']);
   });
@@ -369,6 +373,37 @@ describe('banded projection keeps a reorder inside its group (issue #394)', () =
 describe('orderKeyForDrop scopes the key to the target group (issue #393)', () => {
   const gRow = (id: string, group: string, order?: number) => ({ id, group, order });
 
+  /** The rows and pinned bands a drop produces, the way the viewer writes them.
+   *  A drop that ran out of fractional space returns a whole-group renumbering
+   *  instead of one key, and the viewer writes every row it names. */
+  const dropRows = (
+    rows: { id: string; group: string; order?: number }[],
+    draggedId: string,
+    targetId: string,
+    place: 'before' | 'after',
+  ) => {
+    const drop = orderKeyForDrop(rows, draggedId, targetId, place);
+    if (drop === null) return null;
+    let key: number;
+    let renumbered: Record<string, number> | null = null;
+    if (isRenormalisedDrop(drop)) {
+      renumbered = drop.orders;
+      key = drop.orders[draggedId]!;
+    } else {
+      key = drop;
+    }
+    const targetGroup = groupOf(rows.find((r) => r.id === targetId)!);
+    const regroups = groupOf(rows.find((r) => r.id === draggedId)!) !== targetGroup;
+    // Freeze BEFORE the move, exactly where the viewer freezes.
+    const pinned = regroups ? freezeGroupBands(rows) : {};
+    const next = rows.map((r) => {
+      if (r.id === draggedId) return { ...r, order: key, group: targetGroup };
+      const renumberedOrder = renumbered?.[r.id];
+      return renumberedOrder === undefined ? r : { ...r, order: renumberedOrder };
+    });
+    return { next, pinned, renumbered };
+  };
+
   /** Apply a computed drop and read back the on-screen order, the way the
    *  viewer does: write the key, write the group, then project. */
   const applyDrop = (
@@ -377,16 +412,11 @@ describe('orderKeyForDrop scopes the key to the target group (issue #393)', () =
     targetId: string,
     place: 'before' | 'after',
   ) => {
-    const key = orderKeyForDrop(rows, draggedId, targetId, place);
-    if (key === null) return null;
-    const targetGroup = groupOf(rows.find((r) => r.id === targetId)!);
-    const regroups = groupOf(rows.find((r) => r.id === draggedId)!) !== targetGroup;
-    // Freeze BEFORE the move, exactly where the viewer freezes.
-    const pinned = regroups ? freezeGroupBands(rows) : {};
-    const next = rows.map((r) =>
-      r.id === draggedId ? { ...r, order: key, group: targetGroup } : r,
+    const applied = dropRows(rows, draggedId, targetId, place);
+    if (applied === null) return null;
+    return sortByPaintOrder(applied.next, groupBands(applied.next, applied.pinned)).map(
+      (r) => r.id,
     );
-    return sortByPaintOrder(next, groupBands(next, pinned)).map((r) => r.id);
   };
 
   it('lands a cross-group drop next to the row it was dropped on', () => {
@@ -518,9 +548,13 @@ describe('a drop can land after the target, not only before it (issue #392)', ()
     targetId: string,
     place: 'before' | 'after',
   ) => {
-    const key = orderKeyForDrop(rows, draggedId, targetId, place);
-    if (key === null) return null;
-    const next = rows.map((r) => (r.id === draggedId ? { ...r, order: key } : r));
+    const drop = orderKeyForDrop(rows, draggedId, targetId, place);
+    if (drop === null) return null;
+    // These fixtures never exhaust the key space, so the drop is always a key.
+    // Asserted rather than assumed, so a change that starts renumbering here
+    // fails loudly instead of writing an object into ``order``.
+    expect(isRenormalisedDrop(drop)).toBe(false);
+    const next = rows.map((r) => (r.id === draggedId ? { ...r, order: drop as number } : r));
     return sortByPaintOrder(next, groupBands(next)).map((r) => r.id);
   };
 
@@ -556,16 +590,130 @@ describe('a drop can land after the target, not only before it (issue #392)', ()
     // is where float precision would give out and two rows would compare equal.
     let rows = [gRow('a', 'G'), gRow('b', 'G'), gRow('c', 'G')];
     for (let i = 0; i < 60; i++) {
-      const key = orderKeyForDrop(rows, i % 2 === 0 ? 'a' : 'c', 'b', 'after');
-      if (key === null) continue;
       const moved = i % 2 === 0 ? 'a' : 'c';
-      rows = rows.map((r) => (r.id === moved ? { ...r, order: key } : r));
+      const drop = orderKeyForDrop(rows, moved, 'b', 'after');
+      if (drop === null) continue;
+      // This run is long enough to exhaust the gap, so it is the one existing
+      // scenario that reaches the whole-group renumbering.
+      if (isRenormalisedDrop(drop)) {
+        const orders = drop.orders;
+        rows = rows.map((r) =>
+          orders[r.id] === undefined ? r : { ...r, order: orders[r.id]! },
+        );
+      } else {
+        rows = rows.map((r) => (r.id === moved ? { ...r, order: drop } : r));
+      }
     }
     const ids = sortByPaintOrder(rows, groupBands(rows)).map((r) => r.id);
     expect(ids).toHaveLength(3);
     expect(new Set(ids).size).toBe(3);
     // b keeps its slot; the two rows being nudged stay on the side they landed.
     expect(ids.indexOf('b')).toBeLessThan(ids.length - 1);
+  });
+
+});
+
+/**
+ * Running out of fractional key space (issue #379).
+ *
+ * Every drop into one slot halves the gap between its neighbours, so a long
+ * enough run reaches a gap whose midpoint IS one of its bounds. What these pin
+ * down is the drop on which that happens: it still has to land where it was
+ * released, which is the assertion the halving test above cannot make.
+ */
+describe('exhausting the key space between two neighbours (issue #379)', () => {
+  type Row = { id: string; group: string; order?: number };
+  const gRow = (id: string, group: string, order?: number): Row => ({ id, group, order });
+
+  /** Rows after a drop, the way the viewer writes them: one key normally, and
+   *  the whole group when the drop had to renumber to land. */
+  const dropped = (
+    rows: Row[],
+    draggedId: string,
+    targetId: string,
+    place: 'before' | 'after',
+  ): { renumbered: boolean; next: Row[] } | null => {
+    const drop = orderKeyForDrop(rows, draggedId, targetId, place);
+    if (drop === null) return null;
+    if (!isRenormalisedDrop(drop)) {
+      return {
+        renumbered: false,
+        next: rows.map((r) => (r.id === draggedId ? { ...r, order: drop } : r)),
+      };
+    }
+    const orders = drop.orders;
+    return {
+      renumbered: true,
+      // Compared against undefined, not for truthiness: 0 is a real key and the
+      // first row of a renumbered group always gets it.
+      next: rows.map((r) => (orders[r.id] === undefined ? r : { ...r, order: orders[r.id]! })),
+    };
+  };
+
+  it('lands the drop on which the fractional space runs out', () => {
+    // The halving test stops at "the list is still sane", which stays true even
+    // when a drop was silently refused. This asserts the projected order on
+    // EVERY drop, so the one where the midpoint collapses onto its bound has to
+    // land too. Before renumbering, that drop either painted the row on the far
+    // side of the target or tied their keys and was swallowed as a no-op.
+    let rows = [gRow('a', 'G'), gRow('b', 'G'), gRow('c', 'G')];
+    let renumbers = 0;
+    for (let i = 0; i < 80; i++) {
+      const moved = i % 2 === 0 ? 'a' : 'c';
+      const applied = dropped(rows, moved, 'b', 'after');
+      expect(applied).not.toBeNull();
+      if (applied!.renumbered) renumbers++;
+      const projected = sortByPaintOrder(applied!.next, groupBands(applied!.next)).map(
+        (r) => r.id,
+      );
+      // Released on the upper half of b, so the moved row paints directly above
+      // it. Stated as an adjacency rather than a fixed list, so the assertion is
+      // about where this drop landed and not about where the other row drifted.
+      expect(projected.indexOf(moved)).toBe(projected.indexOf('b') + 1);
+      rows = applied!.next;
+    }
+    // The run has to actually reach exhaustion, or everything above is only
+    // exercising the fast path and would pass against the unfixed function too.
+    expect(renumbers).toBeGreaterThan(0);
+  });
+
+  it('gives every row of the group an explicit key when it renumbers', () => {
+    // A row that was never reordered has no key and falls back to its array
+    // index. Renumbering only the keyed rows would leave it on that fallback,
+    // sorted against integers that mean something else entirely.
+    const rows = [
+      gRow('a', 'G', 1),
+      gRow('b', 'G', 2),
+      gRow('c', 'G', 1.9999999999999998),
+      gRow('unkeyed', 'G'),
+    ];
+    const drop = orderKeyForDrop(rows, 'a', 'c', 'after');
+    expect(isRenormalisedDrop(drop)).toBe(true);
+    const orders = (drop as RenormalisedDrop).orders;
+    expect(Object.keys(orders).sort()).toEqual(['a', 'b', 'c', 'unkeyed']);
+    expect(Object.values(orders).every(Number.isInteger)).toBe(true);
+  });
+
+  it('renumbers only the target group', () => {
+    // The renumber is scoped the way the neighbour search is. Rewriting keys
+    // outside the target group would move rows the user never touched.
+    const rows = [
+      gRow('a1', 'A', 1),
+      gRow('a2', 'A', 2),
+      gRow('a3', 'A', 1.9999999999999998),
+      gRow('b1', 'B', 5),
+      gRow('b2', 'B', 6),
+    ];
+    const drop = orderKeyForDrop(rows, 'a1', 'a3', 'after');
+    expect(isRenormalisedDrop(drop)).toBe(true);
+    expect(Object.keys((drop as RenormalisedDrop).orders).sort()).toEqual(['a1', 'a2', 'a3']);
+  });
+
+  it('still returns a plain number when there is room between the neighbours', () => {
+    // The renumbering path is the exception. Guards against a change that makes
+    // every ordinary drop pay for a multi-row write.
+    const rows = [gRow('a', 'G', 0), gRow('b', 'G', 10), gRow('c', 'G', 20)];
+    expect(orderKeyForDrop(rows, 'a', 'b', 'after')).toBe(15);
   });
 });
 

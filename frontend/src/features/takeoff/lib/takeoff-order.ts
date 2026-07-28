@@ -206,6 +206,33 @@ export function orderKeyBetween(below: number | null, above: number | null): num
 }
 
 /**
+ * A drop that exhausted the fractional key space between its two neighbours and
+ * had to renumber to land (issue #379).
+ *
+ * ``orders`` carries EVERY row of the target group, the dragged row included,
+ * mapped to the integer key it must be rewritten to. The dragged row is in the
+ * map because {@link orderKeyForDrop} leaves it out of its own neighbour search:
+ * renumbering only the rows that search can see would leave the dragged row on
+ * the collapsed key it already holds, which is the defect rather than the fix.
+ *
+ * Shaped like {@link reorderGroups}' band map - whole set, one pass, id to key -
+ * so a caller writes and undoes a renumber the same way it already writes and
+ * undoes a group move.
+ */
+export interface RenormalisedDrop {
+  orders: Record<string, number>;
+}
+
+/** Narrow an {@link orderKeyForDrop} result to the renumbering case. Every
+ *  ordinary drop still comes back as a plain number, so this is the one branch a
+ *  caller has to grow. */
+export function isRenormalisedDrop(
+  result: number | RenormalisedDrop | null,
+): result is RenormalisedDrop {
+  return result !== null && typeof result === 'object';
+}
+
+/**
  * Compute the ``order`` key that drops ``draggedId`` next to ``targetId`` in the
  * paint-order projection (issue #379). ``place`` decides whether the dragged row
  * lands immediately before or after the target in that projection. Effective
@@ -231,13 +258,25 @@ export function orderKeyBetween(below: number | null, above: number | null): num
  * Returns ``null`` when the target is missing or the drop is a no-op (the
  * dragged row would keep its current key AND its current group), so the caller
  * can skip the update.
+ *
+ * Returns a {@link RenormalisedDrop} instead of a key when the space between the
+ * two neighbours is exhausted. Every drop into one slot halves that gap, so
+ * after enough of them the midpoint rounds onto a bound and no single-row key
+ * can express the drop any more: between two explicit keys that is around 50
+ * drops, the exact count set by the bounds' magnitude since it is their ulp that
+ * runs out. Returning the collapsed value would put the row on the wrong side of
+ * the target, or tie it to the target's key and let the no-op guard below
+ * swallow the gesture. Renumbering the group to integers reopens the space and
+ * lands the drop where it was released. It is the only path that writes more
+ * than one row, and it repairs any tie already stored, so a group only ever
+ * needs it once per exhaustion.
  */
 export function orderKeyForDrop<T extends Orderable & { id: string }>(
   items: readonly T[],
   draggedId: string,
   targetId: string,
   place: 'before' | 'after',
-): number | null {
+): number | RenormalisedDrop | null {
   if (draggedId === targetId) return null;
   const target = items.find((m) => m.id === targetId);
   if (!target) return null;
@@ -260,6 +299,21 @@ export function orderKeyForDrop<T extends Orderable & { id: string }>(
   const below = insertAt > 0 ? keyed[insertAt - 1]!.key : null;
   const above = insertAt < keyed.length ? keyed[insertAt]!.key : null;
   const newOrder = orderKeyBetween(below, above);
+  // float64 midpoints run out. Once the gap is down to one ulp of its bound the
+  // midpoint IS that bound, so the key is no longer strictly between anything.
+  // Detect it from the bounds rather than by counting drops: the count that gets
+  // here depends on the keys involved, but the collapse itself is always this.
+  if ((below !== null && newOrder <= below) || (above !== null && newOrder >= above)) {
+    // ``keyed`` is already the target group in ascending effective-key order and
+    // already excludes the dragged row, so splicing it in at ``insertAt`` is the
+    // order the user asked for. Integers restore a full ulp between neighbours.
+    const landed = [...keyed.slice(0, insertAt), { id: draggedId }, ...keyed.slice(insertAt)];
+    const orders: Record<string, number> = {};
+    landed.forEach((row, index) => {
+      orders[row.id] = index;
+    });
+    return { orders };
+  }
   const dragged = items.find((m) => m.id === draggedId);
   // A row that already holds this key but sits in another group is still a real
   // move: the caller has a group change to apply even though the key is
